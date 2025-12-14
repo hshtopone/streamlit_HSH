@@ -1,130 +1,424 @@
-import streamlit as st
+import json
+from datetime import date, timedelta
+
+import numpy as np
 import pandas as pd
+import requests
+import streamlit as st
+from bs4 import BeautifulSoup
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score
 
-# 기본 설정
-st.set_page_config(page_title="자기소개 페이지", page_icon="👨‍🎓", layout="centered")
+try:
+    import altair as alt
+except Exception:
+    alt = None
 
-# 스타일
-CUSTOM_CSS = """
+LAT, LON, TZ = 37.5665, 126.9780, "Asia/Seoul"
+REQ = ["날짜", "대여건수", "평균 기온", "강수량", "PM2.5 농도", "평일 여부"]
+TEST_SIZE = 0.1
+ENH = dict(add_rain_dummy=True, add_season=True, add_trend=False)
+DOW = "월화수목금토일"
+
+
+def _norm_flag(x):
+    s = "" if pd.isna(x) else str(x).strip()
+    return s if s in ("O", "X") else ""
+
+
+def load_excel(file):
+    df = pd.read_excel(file)
+    if not all(c in df.columns for c in REQ):
+        df = df.iloc[:, :6].copy()
+        df.columns = REQ
+    df = df[REQ].copy()
+    df["날짜"] = pd.to_datetime(df["날짜"], errors="coerce")
+    df["평일 여부"] = df["평일 여부"].apply(_norm_flag)
+    for c in ["대여건수", "평균 기온", "강수량", "PM2.5 농도"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=REQ)
+    df = df[df["평일 여부"].isin(["O", "X"])].sort_values("날짜").reset_index(drop=True)
+    return df
+
+
+def split_time(df, test_size=TEST_SIZE):
+    n = len(df)
+    n_tr = max(2, int(np.floor(n * (1 - test_size))))
+    n_tr = min(n_tr, n - 1)
+    return df.iloc[:n_tr].copy(), df.iloc[n_tr:].copy()
+
+
+def build_X(df, mean_T, add_rain_dummy, add_season, add_trend):
+    T = df["평균 기온"].to_numpy(float)
+    R = df["강수량"].to_numpy(float)
+    PM = df["PM2.5 농도"].to_numpy(float)
+    Tc = T - mean_T
+    X = [Tc, Tc**2, np.log1p(R), PM]
+    if add_rain_dummy:
+        X.append((R > 0).astype(int))
+    if add_season:
+        doy = df["날짜"].dt.dayofyear.to_numpy(float)
+        X += [np.sin(2 * np.pi * doy / 365.0), np.cos(2 * np.pi * doy / 365.0)]
+    if add_trend:
+        t = (df["날짜"] - df["날짜"].min()).dt.days.to_numpy(float)
+        X.append(t)
+    return np.column_stack(X)
+
+
+def fit_group(df_group):
+    if len(df_group) < 10:
+        return None
+    tr, te = split_time(df_group, TEST_SIZE)
+    mean_T = float(tr["평균 기온"].mean())
+    Xtr = build_X(tr, mean_T, **ENH)
+    Xte = build_X(te, mean_T, **ENH)
+    ytr = np.log1p(tr["대여건수"].to_numpy(float))
+    yte = np.log1p(te["대여건수"].to_numpy(float))
+    m = LinearRegression().fit(Xtr, ytr)
+    return dict(
+        model=m,
+        mean_T=mean_T,
+        r2_tr=r2_score(ytr, m.predict(Xtr)),
+        r2_te=r2_score(yte, m.predict(Xte)),
+    )
+
+
+def _get_json_via_bs(url):
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    return json.loads(BeautifulSoup(r.text, "html.parser").get_text())
+
+
+@st.cache_data(ttl=60 * 30)
+def fetch_seoul_open_meteo(start_d: date, end_d: date):
+    s, e = start_d.isoformat(), end_d.isoformat()
+    tz = TZ.replace("/", "%2F")
+    url_w = (
+        f"https://api.open-meteo.com/v1/forecast?latitude={LAT}&longitude={LON}"
+        f"&daily=temperature_2m_mean,precipitation_sum&timezone={tz}"
+        f"&start_date={s}&end_date={e}"
+    )
+    url_a = (
+        f"https://air-quality-api.open-meteo.com/v1/air-quality?latitude={LAT}&longitude={LON}"
+        f"&hourly=pm2_5&timezone={tz}"
+        f"&start_date={s}&end_date={e}"
+    )
+    w = _get_json_via_bs(url_w)["daily"]
+    df_w = pd.DataFrame(
+        {"날짜": pd.to_datetime(w["time"]), "평균 기온": w["temperature_2m_mean"], "강수량": w["precipitation_sum"]}
+    )
+    a = _get_json_via_bs(url_a)["hourly"]
+    df_a = pd.DataFrame({"time": pd.to_datetime(a["time"]), "PM2.5 농도": a["pm2_5"]})
+    df_a["날짜"] = df_a["time"].dt.normalize()
+    df_pm = df_a.groupby("날짜", as_index=False)["PM2.5 농도"].mean()
+    return df_w.merge(df_pm, on="날짜", how="left").sort_values("날짜").reset_index(drop=True)
+
+
+def _kr_holiday(d: date):
+    try:
+        import holidays
+        return d in holidays.KR()
+    except Exception:
+        return d.weekday() >= 5
+
+
+def predict_daily(models, meteo_df: pd.DataFrame, pm_fallback: float):
+    rows = []
+    for _, r in meteo_df.iterrows():
+        d = pd.to_datetime(r["날짜"]).normalize()
+        flag = "X" if _kr_holiday(d.date()) else "O"
+        pack = models.get(flag)
+        pm = float(r["PM2.5 농도"]) if pd.notna(r["PM2.5 농도"]) else float(pm_fallback)
+        tmp = pd.DataFrame({"날짜": [d], "평균 기온": [float(r["평균 기온"])], "강수량": [float(r["강수량"])], "PM2.5 농도": [pm]})
+        yhat = np.nan
+        if pack is not None:
+            X = build_X(tmp, pack["mean_T"], **ENH)
+            yhat = float(np.expm1(pack["model"].predict(X)[0]))
+        rows.append({"date": d, "temp": float(r["평균 기온"]), "rain": float(r["강수량"]), "pm25": pm, "pred": yhat})
+    out = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+    out["delta"] = out["pred"].diff()
+    prev = out["pred"].shift(1)
+    out["delta_pct"] = np.where(prev > 0, (out["pred"] / prev - 1.0) * 100.0, np.nan)
+    return out
+
+
+def fmt_int(x):
+    return "-" if pd.isna(x) else f"{int(round(x)):,}"
+
+
+def fmt_delta(x):
+    return "" if pd.isna(x) else f"{int(round(x)):+,}"
+
+
+def fmt_pct(x):
+    return "" if pd.isna(x) else f"({x:+.1f}%)"
+
+
+def fmt_rain_mm(x):
+    if pd.isna(x):
+        return "-"
+    x = float(x)
+    if abs(x) < 1e-12:
+        return "0mm"
+    return f"{int(round(x))}mm" if abs(x - round(x)) < 1e-9 else f"{x:.1f}mm"
+
+
+def weather_emoji(temp, rain):
+    return "🌧️" if rain > 0 else ("☀️" if temp >= 5 else "🥶")
+
+
+def delta_badge_html(d, pct):
+    if pd.isna(d):
+        return '<span class="dneu">&nbsp;</span>'
+    cls = "dpos" if d > 0 else ("dneg" if d < 0 else "dneu")
+    return f'<span class="{cls}">{fmt_delta(d)} {fmt_pct(pct)}</span>'
+
+
+def pick_one(label, options, default):
+    fn = getattr(st, "pills", None)
+    if fn is not None:
+        return fn(label, options, default=default, selection_mode="single")
+    return st.radio(label, options, index=options.index(default), horizontal=True)
+
+
+st.set_page_config(page_title="서울시 공공자전거 대여건수 예측", page_icon="🚲", layout="wide")
+
+st.markdown(
+    """
 <style>
-html, body, [class*="css"]{font-family:Pretendard,-apple-system,Segoe UI,Roboto,Noto Sans KR,Apple SD Gothic Neo,sans-serif;}
-.block-container{padding-top:2.2rem;padding-bottom:3.2rem;}
-
-.header{
-  background:linear-gradient(135deg,#3b82f6 0%,#06b6d4 40%,#22c55e 100%);
-  color:#fff;padding:28px 22px;border-radius:18px;text-align:center;
-  box-shadow:0 10px 30px rgba(0,0,0,.08);
+.block-container{padding-left:1.2rem; padding-right:1.2rem;}
+.card{
+  border:1px solid rgba(255,255,255,.12);
+  border-radius:16px;
+  padding:16px 18px 14px 18px;
+  background:rgba(255,255,255,.03);
+  box-shadow:0 6px 18px rgba(0,0,0,.18);
 }
-.header h1{margin:0;font-size:2rem;letter-spacing:.2px;}
-
-.section{margin:28px 0 32px;}
-.h2{font-size:2rem;font-weight:800;margin:0 0 .5rem 0;}
-
-a.btn{
-  display:inline-block; padding:12px 16px; border-radius:12px; text-decoration:none;
-  font-weight:700; letter-spacing:.2px; color:#fff;
-  background:linear-gradient(135deg,#2563eb 0%,#7c3aed 100%);
-  box-shadow:0 10px 24px rgba(37,99,235,.25);
-  transition:transform .12s ease, box-shadow .12s ease, filter .12s ease;
-  border:none;
+.card.today{
+  border-color:rgba(255,215,0,.70);
+  background:rgba(255,215,0,.14);
 }
-a.btn:hover{
-  transform:translateY(-1px);
-  box-shadow:0 14px 30px rgba(37,99,235,.32);
-  filter:saturate(1.08);
+.card h4{
+  margin:0 0 12px 0;
+  font-size:1.22rem;
+  font-weight:900;
+  line-height:1.15;
 }
-
-.tags{display:flex;flex-wrap:wrap;gap:10px;margin-top:10px;}
-.tag{
-  padding:8px 12px;border-radius:12px;background:transparent;
-  border:1.5px solid #99f6e4;
+.smallcap{opacity:.78;font-size:.88rem; margin-top:2px;}
+.bigrow{
+  display:flex;
+  align-items:baseline;
+  justify-content:flex-start;
+  gap:4px;
+  margin-top:10px;
+}
+.big{font-size:1.60rem;font-weight:900;line-height:1.1;margin:0;}
+.meta{
+  opacity:.90;
   font-size:.94rem;
+  margin-top:12px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
 }
-
-table,.stTable{font-size:.95rem;}
-.card{padding:18px;border:1px solid rgba(0,0,0,.08);border-radius:14px;background:#ffffff10;}
-.helper{color:#64748b;font-size:.92rem;}
-
-/* st.table 열 너비 동일화 (인덱스열 포함 총 6열 균등) */
-[data-testid="stTable"] table{table-layout:fixed; width:100%;}
-[data-testid="stTable"] table th,
-[data-testid="stTable"] table td{width:calc(100% / 6);}
-div[data-baseweb="tab-border"]{border:none !important;}
-hr{border:none !important; height:0 !important;}
+.dpos,.dneg,.dneu{
+  display:inline-block;
+  padding:4px 8px;
+  border-radius:999px;
+  font-size:.92rem;
+  font-weight:700;
+  white-space:nowrap;
+  line-height:1.1;
+}
+.dpos{background:rgba(34,197,94,.18); color:rgba(34,197,94,1);}
+.dneg{background:rgba(239,68,68,.18); color:rgba(239,68,68,1);}
+.dneu{background:rgba(148,163,184,.18); color:rgba(148,163,184,1);}
+div[data-testid="stCaptionContainer"]{text-align:right;}
 </style>
-"""
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-# 헤더
-st.markdown('<div class="header"><h1>자기소개 페이지</h1></div>', unsafe_allow_html=True)
-st.write("")
+st.title("🚲 서울시 공공자전거 대여건수 예측")
 
-# 탭
-tab1, tab2 = st.tabs(["🧾 기본 정보", "📅 시간표"])
+file = st.file_uploader("📎 엑셀 파일 업로드 (.xlsx)", type=["xlsx"])
+if not file:
+    st.stop()
 
-# 기본 정보
+df = load_excel(file)
+models = {"O": fit_group(df[df["평일 여부"] == "O"]), "X": fit_group(df[df["평일 여부"] == "X"])}
+pm_fallback = float(df["PM2.5 농도"].mean()) if len(df) else 0.0
+
+tab1, tab2, tab3 = st.tabs(["대여건수 예측", "데이터 시각화", "프로그램 설명"])
+
 with tab1:
-    st.markdown('<div class="section"><div class="h2">학력</div>', unsafe_allow_html=True)
-    st.write("2022년 12월 대곡고등학교 졸업")
-    st.write("2023년 3월 서울대학교 공과대학 항공우주공학과 입학")
-    st.markdown(
-        '<a class="btn" href="https://aerospace.snu.ac.kr/" target="_blank">학과 홈페이지 방문하기</a>',
-        unsafe_allow_html=True,
-    )
-    st.markdown('</div>', unsafe_allow_html=True)
+    today = date.today()
+    start, end = today - timedelta(days=1), today + timedelta(days=4)
+    try:
+        meteo = fetch_seoul_open_meteo(start, end)
+        pred = predict_daily(models, meteo, pm_fallback)
+        show = pred[(pred["date"].dt.date >= today) & (pred["date"].dt.date <= today + timedelta(days=4))].copy()
+        show = show.sort_values("date").reset_index(drop=True)
 
-    st.markdown('<div class="section"><div class="h2">관심 분야</div>', unsafe_allow_html=True)
-    tags = ["항공우주공학", "산업공학", "경제학", "주식 투자", "인류학"]
-    tag_html = '<div class="tags">' + "".join([f'<span class="tag">{t}</span>' for t in tags]) + "</div>"
-    st.markdown(tag_html, unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+        cols = st.columns(5, gap="small")
+        for i, (_, r) in enumerate(show.iterrows()):
+            d = r["date"].date()
+            dow = DOW[d.weekday()]
+            emo = weather_emoji(r["temp"], r["rain"])
+            cls = "card today" if (d == today) else "card"
+            meta = f"🌡️ {r['temp']:.1f}°C · ☔ {r['rain']:.1f}mm · 🫁 {r['pm25']:.1f}µg/m³"
+            with cols[i]:
+                st.markdown(
+                    f"""
+<div class="{cls}">
+  <h4>{emo} {d.isoformat()} ({dow})</h4>
+  <div class="smallcap">예측 대여건수</div>
+  <div class="bigrow">
+    <div class="big">{fmt_int(r["pred"])}</div>
+    {delta_badge_html(r["delta"], r["delta_pct"])}
+  </div>
+  <div class="meta">{meta}</div>
+</div>
+""",
+                    unsafe_allow_html=True,
+                )
 
-    st.markdown('<div class="section"><div class="h2">Career</div>', unsafe_allow_html=True)
-    st.write("수능 과학탐구 영역 사설 콘텐츠팀 POLARIS 소속, 대외 출판 도서 기획 및 총괄 담당")
-    st.markdown(
-        '<a class="btn" href="https://www.teampolaris.co.kr/" target="_blank">Team POLARIS 홈페이지</a>',
-        unsafe_allow_html=True,
-    )
-    st.markdown('</div>', unsafe_allow_html=True)
+        st.divider()
 
-    st.markdown('<div class="section"><div class="h2">집필 도서 목록</div>', unsafe_allow_html=True)
-    colA, colB = st.columns(2)
-    with colA:
-        st.markdown(
-            '<a class="btn" href="https://product.kyobobook.co.kr/detail/S000217112740" target="_blank">폴라리스 모의고사 시즌1</a>',
-            unsafe_allow_html=True,
-        )
-    with colB:
-        st.markdown(
-            '<a class="btn" href="https://product.kyobobook.co.kr/detail/S000217602755" target="_blank">폴라리스 모의고사 시즌2</a>',
-            unsafe_allow_html=True,
-        )
-    st.markdown('</div>', unsafe_allow_html=True)
+        if len(show) > 0:
+            g = show.copy()
+            g["day_label"] = g["date"].dt.day.astype(int).astype(str) + "일"
+            for c in ["pred", "temp", "rain", "pm25"]:
+                g[c] = pd.to_numeric(g[c], errors="coerce")
 
-# 시간표
+            r1c1, r1c2 = st.columns(2, gap="medium")
+            r2c1, r2c2 = st.columns(2, gap="medium")
+
+            if alt is not None:
+                xenc = alt.X("day_label:N", axis=alt.Axis(labelAngle=0, title=None), sort=g["day_label"].tolist())
+
+                def mk_line(y, title):
+                    return (
+                        alt.Chart(g)
+                        .mark_line(point=True)
+                        .encode(
+                            x=xenc,
+                            y=alt.Y(f"{y}:Q", title=title),
+                            tooltip=[alt.Tooltip("date:T", title="날짜"), alt.Tooltip(f"{y}:Q", title=title)],
+                        )
+                        .properties(height=220)
+                    )
+
+                def mk_bar(y, title):
+                    return (
+                        alt.Chart(g)
+                        .mark_bar()
+                        .encode(
+                            x=xenc,
+                            y=alt.Y(f"{y}:Q", title=title),
+                            tooltip=[alt.Tooltip("date:T", title="날짜"), alt.Tooltip(f"{y}:Q", title=title)],
+                        )
+                        .properties(height=220)
+                    )
+
+                with r1c1:
+                    st.altair_chart(mk_line("pred", "예측 대여건수"), use_container_width=True)
+                with r1c2:
+                    st.altair_chart(mk_line("temp", "평균 기온(°C)"), use_container_width=True)
+                with r2c1:
+                    st.altair_chart(mk_bar("rain", "강수량(mm)"), use_container_width=True)
+                with r2c2:
+                    st.altair_chart(mk_line("pm25", "PM2.5(µg/m³)"), use_container_width=True)
+            else:
+                idx = g["day_label"]
+                with r1c1:
+                    st.line_chart(pd.Series(g["pred"].to_numpy(), index=idx, name="예측 대여건수"))
+                with r1c2:
+                    st.line_chart(pd.Series(g["temp"].to_numpy(), index=idx, name="평균 기온(°C)"))
+                with r2c1:
+                    st.bar_chart(pd.Series(g["rain"].to_numpy(), index=idx, name="강수량(mm)"))
+                with r2c2:
+                    st.line_chart(pd.Series(g["pm25"].to_numpy(), index=idx, name="PM2.5(µg/m³)"))
+
+    except Exception as e:
+        st.error(f"Open-Meteo 불러오기 실패: {e}")
+
 with tab2:
-    st.markdown('<div class="h2">2025년 2학기 시간표</div>', unsafe_allow_html=True)
-    hours = ["1교시","2교시","3교시","4교시","5교시"]
-    data = {
-        "월": ["통계학","경제성공학","공학수학 2","","수학 2"],
-        "화": ["","","","",""],
-        "수": ["통계학","경제성공학","공학수학 2","","수학 2"],
-        "목": ["미시경제이론","미시경제이론","통계학실험","",""],
-        "금": ["컴퓨팅탐색","컴퓨팅탐색","수학연습 2","",""],
-    }
-    df = pd.DataFrame(data, index=hours)
-    st.table(df)
-    st.markdown("</div>", unsafe_allow_html=True)
+    dmin, dmax = df["날짜"].min().date(), df["날짜"].max().date()
+    c1, c2 = st.columns(2, gap="medium")
+    with c1:
+        s = st.date_input("시작 날짜", value=max(dmin, dmax - timedelta(days=30)), min_value=dmin, max_value=dmax)
+    with c2:
+        e = st.date_input("종료 날짜", value=dmax, min_value=dmin, max_value=dmax)
+    if s > e:
+        s, e = e, s
 
-    st.markdown('<div class="section"><div class="h2">이번 학기 요약</div>', unsafe_allow_html=True)
-    m1, m2, m3 = st.columns(3)
-    with m1:
-        st.metric("수강 과목 수", "8개")
-    with m2:
-        st.metric("수강 학점", "19학점")
-    with m3:
-        st.metric("졸업까지 남은 학점", "66학점")
-    st.markdown('</div>', unsafe_allow_html=True)
+    sub = df[(df["날짜"].dt.date >= s) & (df["날짜"].dt.date <= e)].copy()
+    sub2 = sub.rename(columns={"PM2.5 농도": "PM2_5 농도"}).copy()
+    sub2["PM2_5 농도"] = pd.to_numeric(sub2["PM2_5 농도"], errors="coerce")
 
-st.write("")
-st.caption("© 2025 — Streamlit_HSH")
+    choice = pick_one("변수 선택", ["🚲 대여건수", "🌡️ 평균 기온", "☔ 강수량", "😷 초미세먼지"], "🚲 대여건수")
+
+    if choice == "🚲 대여건수":
+        st.line_chart(sub2.set_index("날짜")["대여건수"])
+    elif choice == "🌡️ 평균 기온":
+        st.line_chart(sub2.set_index("날짜")["평균 기온"])
+    elif choice == "☔ 강수량":
+        st.bar_chart(sub2.set_index("날짜")["강수량"])
+    else:
+        st.line_chart(sub2.set_index("날짜")["PM2_5 농도"])
+
+# ---------- tab 3 ----------
+with tab3:
+    o, x = models.get("O"), models.get("X")
+
+    st.markdown("### 회귀분석이란? 📈")
+    st.write(
+        "회귀분석은 **결과(대여건수)** 를 **여러 요인(날씨 변수)** 으로 설명하고 예측하는 방법입니다.\n"
+        "이 앱은 평균 기온, 강수량, 미세먼지 농도를 입력으로 받아 다음과 같은 규칙(수식)을 학습합니다."
+    )
+    st.divider()
+
+    st.markdown("### 왜 log(1+y)를 쓰나요? 🔎")
+    st.write(
+        "대여건수는 날마다 규모가 크게 달라질 수 있습니다. 그대로 회귀하면 큰 값이 모델을 지배하기 쉬워서,\n"
+        "`log(1+y)`로 변환하면 **학습이 더 안정적**이고 예측이 더 잘 되는 경우가 많습니다."
+    )
+    st.divider()
+
+    st.markdown("### 적용한 모형(평일/휴일 분리) 🧠")
+    st.write("평일(O)과 휴일(X)은 이용 패턴이 달라서 **모형을 2개로 나눠** 학습합니다.")
+    st.latex(
+        r"\log(1+y)=\beta_0+\beta_1(T-\bar T)+\beta_2(T-\bar T)^2+\beta_3\log(1+R)+\beta_4 PM"
+        r"+\beta_5 I(R>0)+\beta_6\sin\!\left(\frac{2\pi\cdot doy}{365}\right)+\beta_7\cos\!\left(\frac{2\pi\cdot doy}{365}\right)+\varepsilon"
+    )
+    st.write(
+        "- \(T^2\): 적당한 기온에서 수요가 높아지는 **곡선 관계** 반영\n"
+        "- \(I(R>0)\): 비가 왔는지(0/1)의 효과 분리\n"
+        "- sin/cos: 계절 패턴을 2개 변수로 간단히 반영"
+    )
+    st.divider()
+
+    st.markdown("### 결정계수(R²) 🧾")
+    st.write(
+        "R²는 모델이 실제 변동을 얼마나 설명하는지 나타내는 값입니다.\n"
+        "여기서는 데이터를 시간순으로 나눠 **마지막 10%를 테스트**로 두고 Train/Test R²를 함께 봅니다."
+    )
+    c1, c2, c3, c4 = st.columns(4, gap="medium")
+    c1.metric("평일 Train R²", "-" if o is None else f"{o['r2_tr']:.4f}")
+    c2.metric("평일 Test R²",  "-" if o is None else f"{o['r2_te']:.4f}")
+    c3.metric("휴일 Train R²",  "-" if x is None else f"{x['r2_tr']:.4f}")
+    c4.metric("휴일 Test R²",   "-" if x is None else f"{x['r2_te']:.4f}")
+    st.divider()
+
+    st.markdown("### 핵심 코드(학습) 🧩")
+    st.code(
+        "TEST_SIZE = 0.1\n"
+        "ENH = dict(add_rain_dummy=True, add_season=True, add_trend=False)\n\n"
+        "tr, te = split_time(df_group, test_size=TEST_SIZE)\n"
+        "mean_T = float(tr['평균 기온'].mean())\n"
+        "Xtr = build_X(tr, mean_T, **ENH)\n"
+        "ytr = np.log1p(tr['대여건수'].values)\n"
+        "model = LinearRegression().fit(Xtr, ytr)\n",
+        language="python",
+    )
+
+st.caption("서울대학교 황시현")
