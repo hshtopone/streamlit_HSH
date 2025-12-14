@@ -6,6 +6,7 @@ import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
 
@@ -41,11 +42,14 @@ def load_excel(file):
     return df
 
 
-def split_time(df, test_size=TEST_SIZE):
-    n = len(df)
-    n_tr = max(2, int(np.floor(n * (1 - test_size))))
-    n_tr = min(n_tr, n - 1)
-    return df.iloc[:n_tr].copy(), df.iloc[n_tr:].copy()
+def split_time(df, test_size=TEST_SIZE, random_state=42):
+    tr, te = train_test_split(
+        df,
+        test_size=test_size,
+        shuffle=True,
+        random_state=random_state,
+    )
+    return tr.reset_index(drop=True).copy(), te.reset_index(drop=True).copy()
 
 
 def build_X(df, mean_T, add_rain_dummy, add_season, add_trend):
@@ -239,7 +243,7 @@ div[data-testid="stCaptionContainer"]{text-align:right;}
 
 st.title("🚲 서울시 공공자전거 대여건수 예측")
 
-file = st.file_uploader("📎 엑셀 파일 업로드 (.xlsx)", type=["xlsx"])
+file = st.file_uploader("📎 엑셀 파일 업로드", type=["xlsx"])
 if not file:
     st.stop()
 
@@ -247,7 +251,7 @@ df = load_excel(file)
 models = {"O": fit_group(df[df["평일 여부"] == "O"]), "X": fit_group(df[df["평일 여부"] == "X"])}
 pm_fallback = float(df["PM2.5 농도"].mean()) if len(df) else 0.0
 
-tab1, tab2, tab3 = st.tabs(["대여건수 예측", "데이터 시각화", "프로그램 설명"])
+tab1, tab2, tab3 = st.tabs(["대여건수 예측", "데이터 시각화", "분석 방법 설명"])
 
 with tab1:
     today = date.today()
@@ -264,7 +268,7 @@ with tab1:
             dow = DOW[d.weekday()]
             emo = weather_emoji(r["temp"], r["rain"])
             cls = "card today" if (d == today) else "card"
-            meta = f"🌡️ {r['temp']:.1f}°C · ☔ {r['rain']:.1f}mm · 🫁 {r['pm25']:.1f}µg/m³"
+            meta = f"🌡️ {r['temp']:.1f}°C  ·  ☔ {r['rain']:.1f}mm  ·  😷 {r['pm25']:.1f}µg/m³"
             with cols[i]:
                 st.markdown(
                     f"""
@@ -342,6 +346,7 @@ with tab1:
         st.error(f"Open-Meteo 불러오기 실패: {e}")
 
 with tab2:
+    st.info("사용자가 업로드한 데이터를 시각화하여 보여줍니다.")
     dmin, dmax = df["날짜"].min().date(), df["날짜"].max().date()
     c1, c2 = st.columns(2, gap="medium")
     with c1:
@@ -366,54 +371,65 @@ with tab2:
     else:
         st.line_chart(sub2.set_index("날짜")["PM2_5 농도"])
 
-# ---------- tab 3 ----------
 with tab3:
     o, x = models.get("O"), models.get("X")
 
-    st.markdown("### 회귀분석이란? 📈")
-    st.write(
-        "회귀분석은 **결과(대여건수)** 를 **여러 요인(날씨 변수)** 으로 설명하고 예측하는 방법입니다.\n"
-        "이 앱은 평균 기온, 강수량, 미세먼지 농도를 입력으로 받아 다음과 같은 규칙(수식)을 학습합니다."
+    st.markdown("## 📚 데이터 출처")
+    st.markdown(
+        "예시로 주어진 data.xlsx 파일의 각 데이터에 대한 출처는 다음과 같습니다.\n\n"
+        "• 🚲 **대여건수**: [서울 열린데이터 광장 ‘서울시 공공자전거 이용현황’](https://data.seoul.go.kr/dataList/OA-14994/F/1/datasetView.do)\n"
+        "• 🌡️ **평균 기온**, ☔ **강수량**: [기상자료개발포털 기후통계분석](https://data.kma.go.kr/stcs/grnd/grndRnList.do)\n"
+        "• 😷 **PM2.5(초미세먼지) 농도**: [서울특별시 대기환경정보 일별평균자료](https://cleanair.seoul.go.kr/statistics/dayAverage)\n"
+        "• 📊 향후 5일 동안의 공공자전거 대여건수 예측에 활용하는 날씨 데이터는 BeautifulSoup을 통해 open-meteo.com로부터 실시간으로 가져옵니다."
     )
     st.divider()
 
-    st.markdown("### 왜 log(1+y)를 쓰나요? 🔎")
+    st.markdown("## 🛠️ 분석 방법")
     st.write(
-        "대여건수는 날마다 규모가 크게 달라질 수 있습니다. 그대로 회귀하면 큰 값이 모델을 지배하기 쉬워서,\n"
-        "`log(1+y)`로 변환하면 **학습이 더 안정적**이고 예측이 더 잘 되는 경우가 많습니다."
+        "회귀분석은 **반응변수(공공자전거 대여건수)** 와 **설명변수(평균 기온, 강수량, 초미세먼지 농도, 계절 요인 등)** 의 "
+        "연관성을 수리적 모형으로 분석하는 방법입니다.\n"
+        "이미 주어진 데이터를 학습하여 회귀모형을 도출한 뒤, 새로운 데이터를 모형에 대입하여 예측치를 얻을 수 있습니다.\n\n"
+        "본 연구에서는 다음의 회귀분석모형을 활용하였습니다."
     )
-    st.divider()
 
-    st.markdown("### 적용한 모형(평일/휴일 분리) 🧠")
-    st.write("평일(O)과 휴일(X)은 이용 패턴이 달라서 **모형을 2개로 나눠** 학습합니다.")
     st.latex(
-        r"\log(1+y)=\beta_0+\beta_1(T-\bar T)+\beta_2(T-\bar T)^2+\beta_3\log(1+R)+\beta_4 PM"
-        r"+\beta_5 I(R>0)+\beta_6\sin\!\left(\frac{2\pi\cdot doy}{365}\right)+\beta_7\cos\!\left(\frac{2\pi\cdot doy}{365}\right)+\varepsilon"
+        r"\log(1+y)=\beta_0"
+        r"+\beta_1(T-\bar T)+\beta_2(T-\bar T)^2"
+        r"+\beta_3\log(1+R)"
+        r"+\beta_4 I(R>0)"
+        r"+\beta_5 PM"
+        r"+\beta_6\sin\!\left(\frac{2\pi\cdot doy}{365}\right)"
+        r"+\beta_7\cos\!\left(\frac{2\pi\cdot doy}{365}\right)"
+        r"+\varepsilon"
     )
-    st.write(
-        "- \(T^2\): 적당한 기온에서 수요가 높아지는 **곡선 관계** 반영\n"
-        "- \(I(R>0)\): 비가 왔는지(0/1)의 효과 분리\n"
-        "- sin/cos: 계절 패턴을 2개 변수로 간단히 반영"
-    )
+
+    st.caption("🔎 [참고]")
+    st.caption("• 반응변수 y를 그대로 쓰지 않고 `log(1+y)`로 바꾼 이유는, 일별 값의 변동 폭이 커서 일부 큰 값이 모형에 과도한 영향을 줄 수 있기 때문입니다.")
+    st.caption("• 평일과 주말/공휴일은 활동 패턴이 달라 이용량 구조도 달라지므로, 데이터를 분리해 **평일(O) 모형 / 주말·공휴일(X) 모형**을 각각 학습하여 신뢰도를 높였습니다.")
+    st.caption("• 평균 기온에 이차항이 포함된 이유는, 평균 기온과 대여건수의 관계가 선형이 아니라 ‘적당한 기온에서 증가’하는 비선형 패턴이 나타날 수 있기 때문입니다.")
+    st.caption("• 강수량은 0인 날이 많아 **비가 왔는지 여부(I(R>0))** 를 따로 반영하고, 증가 효과는 `log(1+R)`로 완화했습니다.")
     st.divider()
 
-    st.markdown("### 결정계수(R²) 🧾")
+    st.markdown("## 📏 결정계수(R²)")
     st.write(
-        "R²는 모델이 실제 변동을 얼마나 설명하는지 나타내는 값입니다.\n"
-        "여기서는 데이터를 시간순으로 나눠 **마지막 10%를 테스트**로 두고 Train/Test R²를 함께 봅니다."
+        "결정계수는 회귀모형이 실제 관측치 변동을 얼마나 잘 설명하는지 나타내는 값입니다.\n"
+        "예를 들어 R²=0.8이면, 모형이 변동의 약 80%를 설명할 수 있다는 의미입니다.\n\n"
+        f"사용자 데이터는 **무작위로 90%는 학습(Train), 10%는 테스트(Test)** 에 활용하였으며, "
+        "각각의 결정계수는 다음과 같습니다."
     )
+
     c1, c2, c3, c4 = st.columns(4, gap="medium")
-    c1.metric("평일 Train R²", "-" if o is None else f"{o['r2_tr']:.4f}")
-    c2.metric("평일 Test R²",  "-" if o is None else f"{o['r2_te']:.4f}")
-    c3.metric("휴일 Train R²",  "-" if x is None else f"{x['r2_tr']:.4f}")
-    c4.metric("휴일 Test R²",   "-" if x is None else f"{x['r2_te']:.4f}")
+    c1.metric("🟦 평일 Train R²", "-" if o is None else f"{o['r2_tr']:.4f}")
+    c2.metric("🟦 평일 Test R²",  "-" if o is None else f"{o['r2_te']:.4f}")
+    c3.metric("🟧 주말/공휴일 Train R²", "-" if x is None else f"{x['r2_tr']:.4f}")
+    c4.metric("🟧 주말/공휴일 Test R²",  "-" if x is None else f"{x['r2_te']:.4f}")
     st.divider()
 
-    st.markdown("### 핵심 코드(학습) 🧩")
+    st.markdown("## 🧩 핵심 코드")
     st.code(
         "TEST_SIZE = 0.1\n"
         "ENH = dict(add_rain_dummy=True, add_season=True, add_trend=False)\n\n"
-        "tr, te = split_time(df_group, test_size=TEST_SIZE)\n"
+        "tr, te = split_time(df_group, test_size=TEST_SIZE)\n\n"
         "mean_T = float(tr['평균 기온'].mean())\n"
         "Xtr = build_X(tr, mean_T, **ENH)\n"
         "ytr = np.log1p(tr['대여건수'].values)\n"
