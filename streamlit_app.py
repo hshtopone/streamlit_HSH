@@ -378,11 +378,11 @@ with tab3:
         """
 예시로 주어진 data.xlsx 파일의 각 데이터에 대한 출처는 다음과 같습니다.
 
-• 🚲 대여건수: [서울 열린데이터 광장 ‘서울시 공공자전거 이용현황’](https://data.seoul.go.kr/dataList/OA-14994/F/1/datasetView.do)
-• 🌡️ 평균 기온, ☔ 강수량: [기상자료개발포털 기후통계분석](https://data.kma.go.kr/stcs/grnd/grndRnList.do)
+• 🚲 대여건수: [서울 열린데이터 광장 ‘서울시 공공자전거 이용현황’](https://data.seoul.go.kr/dataList/OA-14994/F/1/datasetView.do)\n
+• 🌡️ 평균 기온, ☔ 강수량: [기상자료개발포털 기후통계분석](https://data.kma.go.kr/stcs/grnd/grndRnList.do)\n
 • 😷 PM2.5(초미세먼지) 농도: [서울특별시 대기환경정보 일별평균자료](https://cleanair.seoul.go.kr/statistics/dayAverage)
 
-•📡 향후 5일 동안의 공공자전거 대여건수 예측에 활용하는 날씨 데이터는 **BeautifulSoup**을 통해 open-meteo.com로부터 실시간으로 가져옵니다.
+•📡 향후 5일 동안의 공공자전거 대여건수 예측에 활용하는 날씨 데이터는 **BeautifulSoup** 모듈을 통해 open-meteo.com로부터 실시간으로 가져옵니다.
 """
     )
     st.divider()
