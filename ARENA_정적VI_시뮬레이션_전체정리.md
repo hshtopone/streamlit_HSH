@@ -1,8 +1,24 @@
-# ARENA 정적 VI 시뮬레이션 — 전체 구현 가이드
+# ARENA 정적 VI 시뮬레이션 — 전체 구현 가이드 (개정판)
 
 > **프로젝트**: 정적 VI(Volatility Interruption) 발동 기준 변동폭의 최적값 탐색
 > **기반 연구**: 안일찬 외 (2017). KRX 정적 VI 도입의 가격안정화 및 가격발견 효과
-> **도구**: ARENA 시뮬레이션 (학생용)
+> **평가 체계**: vi_evaluation_framework — 정규화 + 파레토 + Augmented Tchebycheff + 가중치 민감도
+> **도구**: ARENA 시뮬레이션 (학생용) + Python(pandas/matplotlib/reportlab) 후처리
+
+---
+
+## 개정 이력 (초판 이후 주요 변경)
+
+이 문서는 초판 작성 이후 다음 변경을 반영한 개정판이다.
+
+1. **단일가매매 로직 개선** — 단일가 한 칸만 체결하던 방식을 "교차분 전체 반복 청산 + 단일가 사후 결정"으로 교체 (§9)
+2. **모델 오류 3건 수정** — 단일가 체결·안정시간 측정·미체결량 계산 (§9, §10, §13)
+3. **평가지표 S/D/C 수집 모듈 신설** — 초당 누적 샘플러로 가격불안정성·가격발견지연·거래마찰비용 직접 산출 (§11)
+4. **종료조건·적정가 변수화** — 밴드 [119,130], 접속매매 중에만 안정시간 측정 (§10)
+5. **민감도 자동 스윕** — 시나리오 룩업 테이블 + NREP 디코딩으로 43 시나리오 × 11 변동폭 × 30 복제 = **14,190 실행** 단일 Run (§12)
+6. **실패 복제 기록** — 가격발견 실패 복제도 누락 없이 한 줄씩 기록 (§10, §13)
+7. **분석 파이프라인** — Python 스크립트로 정규화→Tchebycheff→민감도→PDF 보고서 자동화 (§14)
+8. **최종 결과** — 베이스 최적 변동폭 **±9%** (§15)
 
 ---
 
@@ -14,34 +30,38 @@
 4. [ARENA 변수 설계](#4-arena-변수-설계)
 5. [주문 생성 모델](#5-주문-생성-모델)
 6. [주문 가격·수량 부여](#6-주문-가격수량-부여)
-7. [매수 주문 처리 로직 (핵심)](#7-매수-주문-처리-로직-핵심)
+7. [매수 주문 처리 로직](#7-매수-주문-처리-로직)
 8. [매도 주문 처리 로직](#8-매도-주문-처리-로직)
-9. [단일가매매 로직 (VI 제어)](#9-단일가매매-로직-vi-제어)
-10. [시뮬레이션 종료 조건](#10-시뮬레이션-종료-조건)
-11. [결과 기록 및 자동 실험](#11-결과-기록-및-자동-실험)
-12. [구현 중 만난 주요 이슈와 해결](#12-구현-중-만난-주요-이슈와-해결)
-13. [예비 실험 결과 분석](#13-예비-실험-결과-분석)
-14. [모델링 방법 요약 (5가지)](#14-모델링-방법-요약-5가지)
-15. [발표 자료 검토 사항](#15-발표-자료-검토-사항)
-16. [부록: 시장 매칭 원리](#16-부록-시장-매칭-원리)
+9. [단일가매매 로직 (개선판)](#9-단일가매매-로직-개선판)
+10. [시뮬레이션 종료 조건 및 실패 처리](#10-시뮬레이션-종료-조건-및-실패-처리)
+11. [평가지표 수집 (S·D·C)](#11-평가지표-수집-sdc)
+12. [민감도 분석 자동 실험 설계](#12-민감도-분석-자동-실험-설계)
+13. [구현 중 만난 주요 이슈와 해결](#13-구현-중-만난-주요-이슈와-해결)
+14. [분석 파이프라인 (Python 후처리)](#14-분석-파이프라인-python-후처리)
+15. [최종 실험 결과 분석](#15-최종-실험-결과-분석)
+16. [모델링 방법 요약](#16-모델링-방법-요약)
+17. [부록: 시장 매칭 원리](#17-부록-시장-매칭-원리)
 
 ---
 
 ## 1. 프로젝트 개요
 
 ### 연구 목적
-정적 VI 발동 기준 변동폭(%)을 5~15 범위에서 변화시키며 시뮬레이션을 수행하여, 가격안정성·가격발견 효과·유동성의 세 가지 지표를 종합적으로 고려한 최적값을 찾는다.
+정적 VI 발동 기준 변동폭(%)을 5~15 범위에서 변화시키며 시뮬레이션을 수행하여, **가격불안정성·가격발견 지연·거래마찰 비용**의 세 가지 손실지표를 종합적으로 고려한 최적값을 찾는다. 나아가 그 결론이 평가 기준(밴드 폭·머무름 시간)과 시장 조건(적정가)의 변화에도 강건한지 민감도 분석으로 검증한다.
 
 ### 기본 가정
 - 짧은 기간의 주가 변화 시뮬레이션 → 적정가격은 고정
 - 적정가격 > 시가 (상승 국면만 다룸)
-- 적정가격은 상한가(시가의 130%) 초과하지 않음
-- 시가 100원, 적정가격 125원, 호가 단위 1원
+- 적정가격 ≤ 상한가(시가의 130%)
+- 시가 100원, 적정가격 125원(시나리오에 따라 115/120/125), 호가 단위 1원, 상한가 130원
 - 동적 VI 및 임의종료(RE) 제도는 무시
 - VI 발동 시 정확히 2분간 거래 정지
 
 ### 종료 조건
-주가가 적정가격 ±5% 범위(119~131원)에서 2분간 벗어나지 않으면 시뮬레이션 종료
+주가가 적정가격 ±(설정 밴드)% 범위에서 **접속매매 중에** 설정 시간(기본 120초) 동안 벗어나지 않으면 시뮬레이션 종료. 베이스 조건은 밴드 ±5%(119~130원), 머무름 120초.
+
+### 실험 규모
+43개 시나리오 × 변동폭 11종(5~15%) × 복제 30회 = **14,190 실행**(단일 Run 자동 수집).
 
 ---
 
@@ -49,7 +69,7 @@
 
 ### KRX 정적 VI 제도
 - 2015년 6월 15일 도입
-- 직전 단일가매매 체결가 대비 ±10% 변동 예상 시 발동
+- **직전 단일가매매 체결가** 대비 ±10% 변동 예상 시 발동 (하루 중 단일가 체결 때마다 기준가 갱신)
 - 2분간 거래 정지 후 단일가매매로 재개
 - 동시에 가격제한폭 ±15% → ±30%로 확대
 
@@ -59,28 +79,45 @@
 3. **가격제한폭 ±30% 확대로 실현 변동성 14~15% 증가**
 4. **결론**: "여러 모수(예: ±10% 정적 VI 변동폭)에 대한 심도 깊은 검증이 필요"
 
-→ 본 연구는 이 후속 연구 요청에 직접 응답
+→ 본 연구는 이 후속 연구 요청에 직접 응답한다.
 
 ---
 
 ## 3. 평가 지표 설계
 
-### 3대 평가 항목
+### 3.1 3대 손실지표 (모두 작을수록 우수)
 
-| 분류 | 지표 | 의미 | 방향 |
+평가 체계는 종합점수에 들어가는 **3대 손실지표**와, 해석을 돕는 **보조지표**로 구분한다.
+
+| 지표 | 기호 | 정의 | 정규화 |
 |---|---|---|---|
-| **가격안정성** | CumAbsPriceChange | 누적 절대 가격변화 | ↓ |
-| **가격안정성** | MaxOvershoot | 적정가 초과 최대폭 | ↓ |
-| **가격발견** | FirstDiscoveryTime | 첫 적정가 범위 진입 시점 | ↓ |
-| **가격발견** | EndTime | 시뮬레이션 총 소요 시간 | ↓ |
-| **유동성** | TotalTrades | 총 체결 건수 | - |
-| **유동성** | TotalTradeVolume | 총 체결 수량 | - |
-| **유동성** | NumVI | VI 발동 횟수 | ↓ |
-| **유동성** | TotalHaltTime | 총 거래정지 시간 | ↓ |
-| **유동성** | TotalOrders | 총 생성 주문수량 | - |
-| **유동성** | FilledOrders | 체결된 주문수량 | - |
-| **유동성** | UnfilledQty | 미체결 잔량 | ↓ |
-| **유동성** | FillRate (= FilledOrders/TotalOrders) | 체결률 | ↑ |
+| **가격불안정성** | S | 적정가 최초 진입 이후 접속매매 시점의 상대편차 제곱평균 | Z_S = S / S_worst (S_worst=0.005) |
+| **가격발견 지연** | D | 적정가 범위에 지속 안착하기까지의 실제 경과시간(VI 정지 포함) | Z_D = D / 3600 |
+| **거래마찰 비용** | C | 시간가중 미체결량 / (종료시간 × 총주문) | Z_C = C (이미 0~1) |
+
+$$S_r=\frac{1}{|A_r|}\sum_{t\in A_r}\left(\frac{P_t-P^*}{P^*}\right)^2,\quad
+C_r=\frac{\sum_{t=1}^{T_r}U_r(t)}{T_r\cdot Q^{sub}_r},\quad
+U_r(t)=\sum_p BidQty_p+\sum_p AskQty_p$$
+
+- $A_r$ = 최초 밴드 진입 이후 **접속매매 중**(VI 정지 제외) 시점 집합, $P^*$ = 적정가
+- $D_r = T^{discovery}_r$ (실패 시 $D_r=3600$), 가격발견 실패율 $F(w)$는 보조지표
+
+### 3.2 보조지표 (종합점수 제외, 해석용)
+
+| 지표 | 의미 | 방향 |
+|---|---|---|
+| NumVI | VI 발동 횟수 | ↓ |
+| TotalHaltTime | 총 거래정지 시간 | ↓ |
+| TotalTrades / TotalTradeVolume | 총 체결건수/수량 | - |
+| CumAbsPriceChange | 누적 절대 가격변화 | ↓ |
+| MaxOvershoot | 적정가 초과 최대폭 | ↓ |
+| TotalOrders / FilledOrders | 총 생성/체결 주문수량 | - |
+| UnfilledQty | 종료 시 미체결 잔량 | ↓ |
+| **FillRate** | 체결률 = **2 × FilledOrders / TotalOrders** | ↑ |
+| DiscoveryFail | 가격발견 실패 여부(0/1) | ↓ |
+| CallExecQty | 단일가매매 총 체결수량 | - |
+
+> **FillRate 주의**: FilledOrders는 체결량(한쪽만 카운트), TotalOrders는 매수+매도 양면 합산이므로 단순 비는 구조적으로 ≤50%다. 의미 있는 체결률은 **2배 보정**(`2 × FilledOrders / TotalOrders`)이며, 후처리에서 계산한다.
 
 ---
 
@@ -91,13 +128,15 @@
 | 이름 | 의미 | 초기값 |
 |---|---|---|
 | V_CurrentPrice | 현재 주가 | 100 |
-| V_FundamentalPrice | 적정가격 | 125 |
+| V_FundamentalPrice | 적정가격 (시나리오별 세팅) | 125 |
 | V_RefPrice | 현재 정적 VI 기준가격 | 100 |
-| V_VIWidth | 실험에서 설정한 정적 VI 폭 | 5~15 (변동) |
+| V_VIWidth | 정적 VI 폭 (시나리오별 5~15) | (NREP 디코딩) |
+| V_BandPct | 발견 밴드 폭(%) (시나리오별) | (NREP 디코딩) |
+| V_DwellTime | 발견 머무름 시간(초) (시나리오별) | (NREP 디코딩) |
 | V_VIMode | VI 상태 (0=연속매매, 1=거래정지) | 0 |
-| V_MarketStop | 시뮬레이션 종료 플래그 (0=계속, 1=종료) | 0 |
+| V_MarketStop | 종료 플래그 (0=계속, 1=종료) | 0 |
 
-**중요**: ARENA에서 스칼라 변수는 **Rows를 비워두어야 함**. Rows=1로 두면 1차원 배열로 인식되어 dimension 에러 발생.
+**중요**: 스칼라 변수와 Attribute는 **Rows를 비워둬야** 한다(Rows=1이면 1차원 배열로 인식되어 dimension 에러).
 
 ### 4.2 주문장(호가창) 배열 변수
 
@@ -105,94 +144,83 @@
 BidQty[51]: 가격 80~130원의 매수잔량 (인덱스 1~51)
 AskQty[51]: 가격 80~130원의 매도잔량 (인덱스 1~51)
 ```
+**인덱스 매핑**: `인덱스 = A_Price − 79` (100원→21, 125원→46)
 
-**인덱스 매핑 공식**: `인덱스 = A_Price - 79`
-- 예) 가격 100원 → 인덱스 21
-- 예) 가격 125원 → 인덱스 46
+### 4.3 단일가매매 계산용 변수
 
-**범위를 80~130으로 잡은 이유**:
-- 초기 V_CurrentPrice=100 상태에서 매수 offset -2가 나오면 A_Price=98 (인덱스 19)
-- 안전 마진을 위해 80(인덱스 1)까지 확장
-- 매도 offset이 항상 0 이상이므로 V_CurrentPrice가 100 이하로 떨어지지 않음 → 80~130으로 충분
+| 이름 | 초기값 | 의미 |
+|---|---|---|
+| V_CallPrice | 0 | 단일가 |
+| V_CallExecQty | 0 | 단일가 총 체결수량 |
+| V_LastMatchedBid | -9999 | 마지막 체결 매수 한계가 |
+| V_LastMatchedAsk | 9999 | 마지막 체결 매도 한계가 |
+| V_BestAsk / V_BestBid | 0 | 최우선 매도/매수호가 |
+| V_Temp | 0 | 임시값 |
 
-### 4.3 단일가매매 계산용 임시 변수
-
-| 이름 | 초기값 |
-|---|---|
-| V_CallPrice | 0 |
-| V_CallExecQty | 0 |
-| V_BestAsk | 0 |
-| V_BestBid | 0 |
-| V_RemainQty | 0 |
-| V_Temp | 0 |
-
-### 4.4 성과지표용 변수
+### 4.4 성과지표·수집용 변수
 
 | 이름 | 의미 | 초기값 |
 |---|---|---|
 | V_NumVI | VI 발동 횟수 | 0 |
 | V_TotalHaltTime | 총 거래정지 시간 | 0 |
-| V_TotalTradeVolume | 총 체결수량 | 0 |
-| V_TotalTrades | 총 체결건수 | 0 |
+| V_TotalTradeVolume / V_TotalTrades | 총 체결수량/건수 | 0 |
 | V_CumAbsPriceChange | 누적 절대 가격변화 | 0 |
 | V_MaxOvershoot | 적정가 초과 최대폭 | 0 |
-| V_FirstDiscoveryTime | 첫 적정가 진입 시점 | **-1** |
+| V_FirstDiscoveryTime | 첫 밴드 진입 시점 | **-1** |
 | V_EndTime | 종료 시점 | 0 |
-| V_InBandFlag | 현재 적정가 범위 안에 있는지 | 0 |
-| V_BandEntryTime | 적정가 범위 진입 시점 | **-1** |
-| V_TotalOrders | 총 생성 주문수량 | 0 |
-| V_FilledOrders | 체결된 주문수량 | 0 |
-| V_UnfilledQty | 종료 시 미체결 잔량 | 0 |
+| V_BandEntryTime | 현재 밴드 진입 시점 | **-1** |
+| V_TotalOrders / V_FilledOrders / V_UnfilledQty | 총생성/체결/미체결 | 0 |
+| **V_Ur** | 현 시점 미체결 스냅샷(임시) | 0 |
+| **V_TWUnfilled** | 시간가중 미체결량 Σ Ur | 0 |
+| **V_SumSqDev** | Σ((P−F)/F)² | 0 |
+| **V_NSamples** | 안정성 표본 수 \|A_r\| | 0 |
+| **V_StabilityActive** | 최초 밴드 진입 후 1 | 0 |
+| **V_StabilityScore** | 최종 S | 0 |
+| **V_FrictionCost** | 최종 C | 0 |
+| **V_DiscoveryFail** | 가격발견 실패=1 | **1** |
 
-**-1 초기값의 의미**: "아직 발생하지 않았음"을 표현. TNOW=0과 구분하기 위함.
+### 4.5 시나리오 룩업 배열 (1-D, Rows=43)
 
-### 4.5 주문 Attribute (Entity별)
+| 배열 | 의미 |
+|---|---|
+| ScnBandPct[43] | 시나리오별 밴드 폭(%) |
+| ScnDwell[43] | 시나리오별 머무름 시간(초) |
+| ScnFund[43] | 시나리오별 적정가(원) |
+
+추가 스칼라: `V_Scn`(시나리오 인덱스), `V_RepInScn`(시나리오 내 복제 인덱스).
+
+### 4.6 주문 Attribute (Entity별)
 
 | 이름 | 의미 |
 |---|---|
 | A_Side | 매수=1, 매도=-1 |
-| A_Price | 주문가격 |
-| A_Qty | 주문수량 |
-| A_ArrivalTime | 주문 도착 시각 |
-| A_RemainQty | 미체결 잔량 |
+| A_Price / A_Qty / A_RemainQty | 가격/수량/미체결 잔량 |
+| A_ArrivalTime | 도착 시각 |
 | A_GenProb | 주문 통과 확률 |
 
 ---
 
 ## 5. 주문 생성 모델
 
-### 5.1 핵심 아이디어 — 상태의존적 포아송 도착
-
-매 1초마다 잠재 주문 entity를 생성하고, **현재 시장 상황(gap)에 따라 통과 확률을 다르게 부여**하여 piecewise 포아송 프로세스를 구현.
-
+### 5.1 상태의존적 포아송 도착
+매 1초마다 잠재 주문 entity를 생성하고, 현재 시장 상황(gap)에 따라 통과 확률을 다르게 부여하여 piecewise 포아송 프로세스를 구현한다.
 ```
-gap = F - P_t = 적정가격 - 현재가격
+gap = V_FundamentalPrice − V_CurrentPrice (적정가 − 현재가)
 ```
 
-### 5.2 매수 도착률 (gap이 클수록 자주)
+### 5.2 도착률 (매수: gap 클수록 자주 / 매도: gap 작을수록 자주)
 
-| gap 범위 | 평균 도착간격 | 통과확률 (= 1/간격) |
+| gap | 매수 간격 | 매도 간격 |
 |---|---|---|
-| ≥ 20 | EXPO(1.5) | 1/1.5 ≈ 0.667 |
-| 15~19 | EXPO(2.0) | 1/2.0 = 0.500 |
-| 10~14 | EXPO(2.8) | 1/2.8 ≈ 0.357 |
-| 5~9 | EXPO(3.8) | 1/3.8 ≈ 0.263 |
-| 0~4 | EXPO(5.0) | 1/5.0 = 0.200 |
+| ≥20 | EXPO(1.5) | EXPO(4.5) |
+| 15~19 | EXPO(2.0) | EXPO(4.0) |
+| 10~14 | EXPO(2.8) | EXPO(3.6) |
+| 5~9 | EXPO(3.8) | EXPO(3.3) |
+| 0~4 | EXPO(5.0) | EXPO(3.0) |
 
-### 5.3 매도 도착률 (gap이 작을수록 자주)
+### 5.3 A_GenProb 누적 차분 수식 (`<` 연산자 회피)
 
-| gap 범위 | 평균 도착간격 | 통과확률 |
-|---|---|---|
-| ≥ 20 | EXPO(4.5) | 1/4.5 ≈ 0.222 |
-| 15~19 | EXPO(4.0) | 1/4.0 = 0.250 |
-| 10~14 | EXPO(3.6) | 1/3.6 ≈ 0.278 |
-| 5~9 | EXPO(3.3) | 1/3.3 ≈ 0.303 |
-| 0~4 | EXPO(3.0) | 1/3.0 ≈ 0.333 |
-
-### 5.4 ARENA 구현 — 매수 A_GenProb 수식 (개선판)
-
-ARENA의 `<` 연산자 문제를 우회하기 위해 **누적 차분 방식** 사용:
-
+매수:
 ```
 (V_FundamentalPrice - V_CurrentPrice >= 20) * (1/1.5 - 1/2.0) +
 (V_FundamentalPrice - V_CurrentPrice >= 15) * (1/2.0 - 1/2.8) +
@@ -200,845 +228,443 @@ ARENA의 `<` 연산자 문제를 우회하기 위해 **누적 차분 방식** �
 (V_FundamentalPrice - V_CurrentPrice >= 5)  * (1/3.8 - 1/5.0) +
 (V_FundamentalPrice - V_CurrentPrice >= 0)  * (1/5.0)
 ```
+매도는 동일 구조에 매도 간격(1/4.5 − 1/4.0 …)을 사용. gap이 클수록 더 많은 항이 활성화되어 정확한 확률값에 도달.
 
-**원리**: gap이 클수록 더 많은 항이 활성화되어 누적 → 정확한 값에 도달
-
-**검증**:
-- gap=25 (≥20): 모든 항 활성 → 1/1.5 ✅
-- gap=17 (≥15): 위 4개 → 1/2.0 ✅
-- gap=12 (≥10): 위 3개 → 1/2.8 ✅
-- gap=7 (≥5): 위 2개 → 1/3.8 ✅
-- gap=2 (≥0): 마지막 1개 → 1/5.0 ✅
-
-### 5.5 매도 A_GenProb 수식
-
+### 5.4 ARENA 모듈 구성
 ```
-(V_FundamentalPrice - V_CurrentPrice >= 20) * (1/4.5 - 1/4.0) +
-(V_FundamentalPrice - V_CurrentPrice >= 15) * (1/4.0 - 1/3.6) +
-(V_FundamentalPrice - V_CurrentPrice >= 10) * (1/3.6 - 1/3.3) +
-(V_FundamentalPrice - V_CurrentPrice >= 5)  * (1/3.3 - 1/3.0) +
-(V_FundamentalPrice - V_CurrentPrice >= 0)  * (1/3.0)
+[Create_BuyOrder] → [Assign_BuyRate] → [Decide_BuyFilter (2-way by Chance, A_GenProb*100)] → ...
+[Create_SellOrder] → [Assign_SellRate] → [Decide_SellFilter] → ...
 ```
+Create: Type=Constant, Value=1, Units=Seconds, **First Creation=1.0**, Max Arrivals=Infinite.
 
-**주의**: 매도는 차이값이 음수가 됨 (gap 클수록 매도 통과확률 감소).
-
-### 5.6 ARENA 모듈 구성
-
-```
-[Create_BuyOrder] ──→ [Assign_BuyRate (A_GenProb 계산)] ──→ [Decide_BuyFilter]
-   1초마다                                                    True/False
-                                                                ↓ False
-                                                           [Dispose_Buy]
-
-[Create_SellOrder] ──→ [Assign_SellRate] ──→ [Decide_SellFilter] ──→ ...
-```
-
-**Create 모듈 설정**:
-- Type: Constant
-- Value: 1
-- Units: Seconds
-- Max Arrivals: Infinite
-
-**Decide 모듈 설정**:
-- Type: 2-way by Chance
-- Percent True: `A_GenProb * 100` (×100 필수!)
+> ⚠️ 주문/감시 Create의 **First Creation=1.0**, 초기화 엔티티만 0.0이어야 한다 (§13.10).
 
 ---
 
 ## 6. 주문 가격·수량 부여
 
-### 6.1 주문 수량 분포
-
+### 6.1 수량
 ```
-A_Qty = DISC(0.5, 1, 0.8, 2, 1.0, 3)
-```
-
-- 1주: 50%, 2주: 30%, 3주: 20%
-
-**주의**: `A_Qty`와 `A_RemainQty`에 같은 값이 들어가야 하므로:
-```
-A_Qty = DISC(0.5, 1, 0.8, 2, 1.0, 3)
-A_RemainQty = A_Qty  ← 같은 값 복사
+A_Qty = DISC(0.5, 1, 0.8, 2, 1.0, 3)   (1주 50%, 2주 30%, 3주 20%)
+A_RemainQty = A_Qty
 ```
 
-### 6.2 매수 주문 가격 분포 (gap별)
+### 6.2 매수 가격 (gap별 offset)
+- gap ≥ 15: `A_Price = V_CurrentPrice + DISC(0.35,2, 0.75,1, 0.95,0, 1.0,-1)`
+- 5 ≤ gap < 15: `+ DISC(0.35,1, 0.75,0, 0.95,-1, 1.0,-2)`
+- gap < 5: `+ DISC(0.20,1, 0.60,0, 0.90,-1, 1.0,-2)`
 
-#### gap ≥ 15 (공격적 매수)
-| Offset | 확률 |
-|---|---|
-| +2 | 0.35 |
-| +1 | 0.40 |
-| 0 | 0.20 |
-| -1 | 0.05 |
+### 6.3 매도 가격 (offset ≥ 0, 현재가 미만 매도 없음)
+- gap ≥ 15: `+ DISC(0.10,0, 0.45,1, 0.80,2, 1.0,3)`
+- 5 ≤ gap < 15: `+ DISC(0.20,0, 0.60,1, 0.90,2, 1.0,3)`
+- gap < 5: `+ DISC(0.30,0, 0.70,1, 0.90,2, 1.0,3)`
 
+### 6.4 공통
 ```
-A_Price = V_CurrentPrice + DISC(0.35, 2, 0.75, 1, 0.95, 0, 1.0, -1)
-```
-
-#### 5 ≤ gap < 15
-| Offset | 확률 |
-|---|---|
-| +1 | 0.35 |
-| 0 | 0.40 |
-| -1 | 0.20 |
-| -2 | 0.05 |
-
-```
-A_Price = V_CurrentPrice + DISC(0.35, 1, 0.75, 0, 0.95, -1, 1.0, -2)
-```
-
-#### gap < 5
-| Offset | 확률 |
-|---|---|
-| +1 | 0.20 |
-| 0 | 0.40 |
-| -1 | 0.30 |
-| -2 | 0.10 |
-
-```
-A_Price = V_CurrentPrice + DISC(0.20, 1, 0.60, 0, 0.90, -1, 1.0, -2)
-```
-
-### 6.3 매도 주문 가격 분포 (gap별)
-
-#### gap ≥ 15 (덜 공격적)
-| Offset | 확률 |
-|---|---|
-| 0 | 0.10 |
-| +1 | 0.35 |
-| +2 | 0.35 |
-| +3 | 0.20 |
-
-```
-A_Price = V_CurrentPrice + DISC(0.10, 0, 0.45, 1, 0.80, 2, 1.0, 3)
-```
-
-#### 5 ≤ gap < 15
-```
-A_Price = V_CurrentPrice + DISC(0.20, 0, 0.60, 1, 0.90, 2, 1.0, 3)
-```
-
-#### gap < 5
-```
-A_Price = V_CurrentPrice + DISC(0.30, 0, 0.70, 1, 0.90, 2, 1.0, 3)
-```
-
-**매도자의 행동 가정**: 매도 offset이 항상 0 이상 → 현재가 미만으로는 절대 팔지 않음 (상승 국면 가정과 부합).
-
-### 6.4 흐름도
-
-```
-[Decide_BuyFilter] ──True──→ [Assign_BuySide (A_Side=1, A_Qty, A_RemainQty, A_ArrivalTime)]
-                                  ↓
-                              [Decide_BuyGap]
-                              ├─(gap≥15)──→ [Assign_BuyPrice_Gap15plus]
-                              ├─(5≤gap<15)─→ [Assign_BuyPrice_Gap5to15]
-                              └─(else)─────→ [Assign_BuyPrice_GapLess5]
-                                                ↓ (모두 수렴)
-                                            (다음 단계로)
-```
-
-**V_TotalOrders 카운트**: Assign_BuySide와 Assign_SellSide에 추가
-```
-V_TotalOrders = V_TotalOrders + A_Qty
-```
-
-### 6.5 가격 클램핑 (안전장치)
-
-각 가격 Assign의 마지막에 추가:
-```
-A_Price = MX(80, MN(130, A_Price))
+V_TotalOrders = V_TotalOrders + A_Qty   (BuySide/SellSide 양쪽)
+A_Price = MX(80, MN(130, A_Price))       (클램핑)
 ```
 
 ---
 
-## 7. 매수 주문 처리 로직 (핵심)
+## 7. 매수 주문 처리 로직
 
-### 7.1 전체 흐름도
-
+### 7.1 흐름
 ```
 (매수 가격 부여 완료)
-    ↓
-[Decide_VICheck_Buy]──True (VI중)──→ [Assign_ParkBuy]──→[Dispose_BuyParked]
-    ↓ False
-[Label: LBL_FindBestAsk_Buy] ←──────────────────────────┐
-    ↓                                                     │
-[Assign_FindBestAsk] (51개 인자 압축 수식)                 │
-    ↓                                                     │
-[Decide_PriceMatch_Buy]──True (불가)──→ [Assign_ParkBuy] │
-    ↓ False (체결 가능)                                    │
-[Decide_VITrigger_Buy]──True (VI 발동)──→ [Separate]    │
-    ↓ False                              ├─원본→ [Assign_TriggerVI_Buy]→[Assign_ParkBuy]→[Dispose]
-[Assign_ExecuteTrade_Buy]                └─복제→ [VI 제어 라인]
-    ↓
-[Decide_RemainCheck_Buy]──True (잔량)──→ [Go to LBL_FindBestAsk_Buy]
-    ↓ False                                       (위로 점프)
-[Dispose_BuyDone]
+ → Decide_VICheck_Buy (V_VIMode==1?) ─True→ Assign_ParkBuy → Dispose
+ → [LBL_FindBestAsk_Buy] → Assign_FindBestAsk (51-인자 MN) 
+ → Decide_PriceMatch_Buy (A_Price < V_BestAsk?) ─True→ ParkBuy
+ → Decide_VITrigger_Buy (V_BestAsk >= V_RefPrice*(1+V_VIWidth/100)?) ─True→ Separate → VI 라인
+ → Assign_ExecuteTrade_Buy
+ → Decide_RemainCheck_Buy (A_RemainQty>0?) ─True→ Go to LBL_FindBestAsk_Buy
+ → Dispose_BuyDone
 ```
 
-### 7.2 Step 1: VI 상태 확인
-
+### 7.2 BestAsk 압축 탐색 (51-인자)
 ```
-Decide_VICheck_Buy 설정:
-  Type: 2-way by Condition
-  If: Variable V_VIMode == 1
+V_BestAsk = MN( (AskQty(1)>0)*80 + (AskQty(1)==0)*9999, ... ,
+                (AskQty(51)>0)*130 + (AskQty(51)==0)*9999 )
 ```
 
-- **True (VI 거래정지 중)**: 체결 시도하지 않고 BidQty에 적재 후 소멸
-- **False (연속매매 중)**: 다음 단계 진행
-
-### 7.3 Step 2: Assign_ParkBuy (주문장 적재)
-
+### 7.3 Assign_ExecuteTrade_Buy (순차 실행)
 ```
-Type: Variable Array (1D)
-Variable Name: BidQty
-Row: A_Price - 79
-New Value: BidQty(A_Price - 79) + A_RemainQty
-```
-
-→ `BidQty[A_Price] += A_RemainQty`
-
-### 7.4 Step 3: BestAsk 압축 탐색 수식 (51개 인자)
-
-**Assign_FindBestAsk**:
-```
-V_BestAsk = MN(
-  (AskQty(1)>0)*80  + (AskQty(1)==0)*9999,
-  (AskQty(2)>0)*81  + (AskQty(2)==0)*9999,
-  (AskQty(3)>0)*82  + (AskQty(3)==0)*9999,
-  ...
-  (AskQty(51)>0)*130 + (AskQty(51)==0)*9999
-)
+V_Temp = MN(A_RemainQty, AskQty(V_BestAsk-79))
+AskQty(V_BestAsk-79) -= V_Temp
+A_RemainQty -= V_Temp
+V_TotalTradeVolume += V_Temp ; V_TotalTrades += 1 ; V_FilledOrders += V_Temp
+V_Temp = V_CurrentPrice ; V_CurrentPrice = V_BestAsk
+V_CumAbsPriceChange += ABS(V_CurrentPrice - V_Temp)
+V_MaxOvershoot = MX(V_MaxOvershoot, V_CurrentPrice - V_FundamentalPrice)
 ```
 
-**원리**:
-- 잔량 있는 가격 → 가격값 반환
-- 잔량 없으면 → 9999 (절대 못 이길 큰 값) 반환
-- MN으로 최솟값 → **잔량 있는 가격 중 가장 낮은 값**(=BestAsk)
-- 매도잔량이 모두 0이면 → 9999 반환 (= "매도잔량 없음" 표시)
-
-### 7.5 Step 4: 가격 매칭 검사
-
+### 7.4 VI 발동 시 (Assign_TriggerVI_Buy)
 ```
-Decide_PriceMatch_Buy 설정:
-  Type: 2-way by Condition
-  If: Expression A_Price < V_BestAsk
-```
-
-- **True (체결 불가)**: 주문가가 BestAsk보다 낮음 → BidQty 적재
-- **False (체결 가능)**: A_Price ≥ V_BestAsk → 다음 단계 진행
-- V_BestAsk=9999면 자동으로 True (체결 불가)
-
-### 7.6 Step 5: VI 발동 검사
-
-```
-Decide_VITrigger_Buy 설정:
-  Type: 2-way by Condition
-  If: Expression V_BestAsk >= V_RefPrice * (1 + V_VIWidth/100)
-```
-
-- **True (VI 발동)**: Separate로 분리 → 원본은 Park&Dispose, 복제는 VI 제어 라인으로
-- **False (정상)**: 체결 진행
-
-### 7.7 Step 6: 실제 체결 (Assign_ExecuteTrade_Buy)
-
-| 순서 | Type | 변수/속성 | 값 |
-|---|---|---|---|
-| 1 | Variable | V_Temp | MN(A_RemainQty, AskQty(V_BestAsk - 79)) |
-| 2 | Variable Array (1D) | AskQty | AskQty(V_BestAsk - 79) - V_Temp |
-| 3 | Attribute | A_RemainQty | A_RemainQty - V_Temp |
-| 4 | Variable | V_TotalTradeVolume | V_TotalTradeVolume + V_Temp |
-| 5 | Variable | V_TotalTrades | V_TotalTrades + 1 |
-| 6 | Variable | V_FilledOrders | V_FilledOrders + V_Temp |
-| 7 | Variable | V_Temp | V_CurrentPrice (옛 가격 저장) |
-| 8 | Variable | V_CurrentPrice | V_BestAsk (현재가 갱신) |
-| 9 | Variable | V_CumAbsPriceChange | V_CumAbsPriceChange + ABS(V_CurrentPrice - V_Temp) |
-| 10 | Variable | V_MaxOvershoot | MX(V_MaxOvershoot, V_CurrentPrice - V_FundamentalPrice) |
-
-**중요**: ARENA Assign은 위에서 아래로 순차 실행되므로 순서 매우 중요.
-
-### 7.8 Step 7: 잔량 체크 및 반복
-
-```
-Decide_RemainCheck_Buy 설정:
-  If: Expression A_RemainQty > 0
-```
-
-- **True (잔량 있음)**: Go to Label `LBL_FindBestAsk_Buy` → 다음 호가와 추가 매칭
-- **False (잔량 없음)**: Dispose_BuyDone
-
-### 7.9 Assign_TriggerVI_Buy (VI 발동 시)
-
-```
-V_VIMode = 1
-V_NumVI = V_NumVI + 1
-V_TotalHaltTime = V_TotalHaltTime + 120
+V_VIMode = 1 ; V_NumVI += 1 ; V_TotalHaltTime += 120
 ```
 
 ---
 
 ## 8. 매도 주문 처리 로직
 
-### 8.1 매수와의 핵심 차이점
+매수와 대칭. 핵심 차이:
 
 | 위치 | 매수 | 매도 |
 |---|---|---|
-| Park 시 적재 배열 | BidQty | **AskQty** |
+| 적재 배열 | BidQty | **AskQty** |
 | 탐색 함수 | MN | **MX** |
 | 탐색 변수 | V_BestAsk | **V_BestBid** |
-| 탐색 대상 호가 배열 | AskQty | **BidQty** |
-| 안 잡힐 때 기본값 | +9999 | **-9999** |
-| 가격 매칭 부등호 | A_Price < V_BestAsk | **A_Price > V_BestBid** |
-| 체결 시 차감 배열 | AskQty | **BidQty** |
-| Label 이름 | LBL_FindBestAsk_Buy | **LBL_FindBestBid_Sell** |
-
-### 8.2 BestBid 압축 수식 (51개 인자)
+| 탐색 대상 | AskQty | **BidQty** |
+| 미발견 기본값 | +9999 | **-9999** |
+| 매칭 부등호 | A_Price < V_BestAsk | **A_Price > V_BestBid** |
 
 ```
-V_BestBid = MX(
-  (BidQty(1)>0)*80  + (BidQty(1)==0)*(-9999),
-  (BidQty(2)>0)*81  + (BidQty(2)==0)*(-9999),
-  ...
-  (BidQty(51)>0)*130 + (BidQty(51)==0)*(-9999)
-)
+V_BestBid = MX( (BidQty(1)>0)*80 + (BidQty(1)==0)*(-9999), ... ,
+                (BidQty(51)>0)*130 + (BidQty(51)==0)*(-9999) )
 ```
-
-**원리**: 매수잔량 있는 가격 → 가격값, 없으면 -9999. MX로 최댓값 → 가장 높은 매수호가.
-
-### 8.3 Assign_ExecuteTrade_Sell
-
-매수와 거의 같지만 **AskQty → BidQty**, **V_BestAsk → V_BestBid** 로 변경:
-
-```
-V_Temp = MN(A_RemainQty, BidQty(V_BestBid - 79))
-BidQty(V_BestBid - 79) = BidQty(V_BestBid - 79) - V_Temp
-A_RemainQty = A_RemainQty - V_Temp
-V_TotalTradeVolume = V_TotalTradeVolume + V_Temp
-V_TotalTrades = V_TotalTrades + 1
-V_FilledOrders = V_FilledOrders + V_Temp
-V_Temp = V_CurrentPrice
-V_CurrentPrice = V_BestBid
-V_CumAbsPriceChange = V_CumAbsPriceChange + ABS(V_CurrentPrice - V_Temp)
-V_MaxOvershoot = MX(V_MaxOvershoot, V_CurrentPrice - V_FundamentalPrice)
-```
+체결은 `BidQty(V_BestBid-79)` 차감, `V_CurrentPrice = V_BestBid`로 갱신.
 
 ---
 
-## 9. 단일가매매 로직 (VI 제어)
+## 9. 단일가매매 로직 (개선판)
+
+> **변경 핵심**: 기존엔 "단일가 = 최우선호가 중간값"을 먼저 정하고 그 가격에 **정확히 일치하는 주문만** 체결 → VI 정지 중 쌓인 교차 주문이 청산되지 않고 남는 문제가 있었다. 개정판은 **교차분을 먼저 전부 반복 체결**하고, 마지막 체결 한계가를 이용해 **단일가를 사후 결정**한다 (거래량 최대화 + 비교차 호가창 보장).
 
 ### 9.1 전체 흐름
-
 ```
-[Decide_VITrigger_Buy/Sell] ──True──→ [Separate_VI]
-                                          ├─Original─→ [Assign_TriggerVI] → [Assign_Park] → [Dispose]
-                                          └─Duplicate(1)─┐
-                                                         ↓
-                                    [Delay_VIHalt: 120초]
-                                          ↓
-                                    [Assign_CalcCallPrice] (단일가 계산)
-                                          ↓
-                                    [Assign_ExecuteCallAuction] (단일가 체결)
-                                          ↓
-                                    [Assign_ResetVI] (V_VIMode=0, V_RefPrice 갱신)
-                                          ↓
-                                    [Dispose_VIControl]
+Decide_VITrigger → Separate_VI (Duplicate 1)
+   ├─ Original  → Assign_TriggerVI → Assign_Park → Dispose
+   └─ Duplicate → Delay_VIHalt(120초)
+                    → Assign_CallInit
+                    → [LBL_CallMatch] → Assign_CallFindBest
+                       → Decide_CallCrossed (V_BestBid >= V_BestAsk)
+                          ├─True → Assign_CallExec → Go to LBL_CallMatch
+                          └─False → Assign_ResetVI → Dispose_VIControl
 ```
+> Label은 입력 포트가 없으므로 선을 넣지 않는다. `Assign_CallInit`(첫 진입)과 `LBL_CallMatch`(반복) 둘 다 `Assign_CallFindBest`로 연결 (매수 루프 `LBL_FindBestAsk_Buy`와 동일 배선).
 
-### 9.2 Separate 모듈
-
+### 9.2 Assign_CallInit
 ```
-Separate_VI_Buy/Sell 설정:
-  Type: Duplicate Original
-  # of Duplicates: 1
+V_CallExecQty = 0
+V_LastMatchedBid = -9999
+V_LastMatchedAsk = 9999
 ```
 
-- **Original 출력**: 기존 흐름 (Park & Dispose)
-- **Duplicate 출력**: VI 제어 라인 (Delay → 단일가매매)
+### 9.3 Assign_CallFindBest (매 반복 최우선호가 재계산)
+§7.2 / §8 의 51-인자 MN/MX 수식으로 `V_BestAsk`, `V_BestBid` 재계산.
 
-### 9.3 Delay 모듈 (Advanced Process 패널)
-
+### 9.4 Decide_CallCrossed
 ```
-Delay_VIHalt 설정:
-  Allocation: Other
-  Delay Time: 120
-  Units: Seconds
+If: V_BestBid >= V_BestAsk   (True=교차 지속 / False=교차 해소 또는 한쪽 잔량 없음)
 ```
+한쪽이 비면 9999/-9999가 들어와 자동으로 False → 별도 예외처리 불필요.
 
-### 9.4 Assign_CalcCallPrice — 단일가 계산 (접근 B: 중간값)
-
-**1단계**: V_BestAsk, V_BestBid 재계산 (51개 인자 압축 수식)
-
-**2단계**: V_CallPrice 계산 (예외 처리 포함)
-
+### 9.5 Assign_CallExec (최우선끼리 체결 + 마지막 한계가 기록)
 ```
-V_CallPrice = 
-  (V_BestAsk == 9999) * (1 - (V_BestBid == -9999)) * V_BestBid +
-  (1 - (V_BestAsk == 9999)) * (V_BestBid == -9999) * V_BestAsk +
-  (1 - (V_BestAsk == 9999)) * (1 - (V_BestBid == -9999)) * AINT((V_BestBid + V_BestAsk) / 2 + 0.5) +
-  (V_BestAsk == 9999) * (V_BestBid == -9999) * V_CurrentPrice
+V_Temp = MN( BidQty(V_BestBid-79), AskQty(V_BestAsk-79) )
+BidQty(V_BestBid-79) -= V_Temp
+AskQty(V_BestAsk-79) -= V_Temp
+V_LastMatchedBid = V_BestBid
+V_LastMatchedAsk = V_BestAsk
+V_CallExecQty += V_Temp
+V_TotalTradeVolume += V_Temp ; V_TotalTrades += 1 ; V_FilledOrders += V_Temp
 ```
+→ 출력은 **Go to LBL_CallMatch**. 각 반복에서 최소 한 호가가 0이 되어 최대 51회 내 종료(무한루프 없음). 종료 시 `V_LastMatchedAsk ≤ V_LastMatchedBid`가 보장되어 그 사이 가격은 체결된 모든 주문에 적용 가능하다.
 
-**케이스별 검증**:
-
-| Case | V_BestAsk | V_BestBid | V_CallPrice |
-|---|---|---|---|
-| 둘 다 정상 (110/108) | 110 | 108 | 109 ✅ |
-| BestAsk만 비정상 | 9999 | 108 | 108 ✅ |
-| BestBid만 비정상 | 110 | -9999 | 110 ✅ |
-| 둘 다 비정상 | 9999 | -9999 | V_CurrentPrice ✅ |
-
-**3단계**: 안전망 클램핑
+### 9.6 Assign_ResetVI (단일가 사후 결정 + 상태 복귀)
 ```
-V_CallPrice = MX(80, MN(130, V_CallPrice))
-```
-
-### 9.5 ARENA의 `!=` 우회법
-
-ARENA가 `!=` 연산자를 지원하지 않는 경우 `1 - ==` 로 우회:
-
-| 원하는 연산 | 우회법 |
-|---|---|
-| `A != B` | `1 - (A == B)` |
-| `A != B` (대안) | `(A < B) + (A > B)` |
-| `A == B && C == D` | `(A == B) * (C == D)` |
-| `A == B \|\| C == D` | `(A == B) + (C == D) - (A == B) * (C == D)` |
-
-### 9.6 Assign_ExecuteCallAuction — 단일가 체결
-
-단순화: V_CallPrice에서 BidQty와 AskQty의 같은 가격대만 매칭
-
-```
-V_Temp = MN(BidQty(V_CallPrice - 79), AskQty(V_CallPrice - 79))
-BidQty(V_CallPrice - 79) = BidQty(V_CallPrice - 79) - V_Temp
-AskQty(V_CallPrice - 79) = AskQty(V_CallPrice - 79) - V_Temp
-V_TotalTradeVolume = V_TotalTradeVolume + V_Temp
-V_TotalTrades = V_TotalTrades + (V_Temp > 0)
-V_FilledOrders = V_FilledOrders + V_Temp
-```
-
-### 9.7 Assign_ResetVI
-
-```
+V_CallPrice = (V_CallExecQty > 0) * MAX(V_LastMatchedAsk, MIN(V_RefPrice, V_LastMatchedBid))
+            + (V_CallExecQty == 0) * V_CurrentPrice
 V_Temp = V_CurrentPrice
 V_CurrentPrice = V_CallPrice
-V_RefPrice = V_CallPrice  ← VI 기준가 갱신
-V_CumAbsPriceChange = V_CumAbsPriceChange + ABS(V_CurrentPrice - V_Temp)
+V_CumAbsPriceChange += ABS(V_CurrentPrice - V_Temp)
 V_MaxOvershoot = MX(V_MaxOvershoot, V_CurrentPrice - V_FundamentalPrice)
-V_VIMode = 0  ← 연속매매 복귀
+V_RefPrice = V_CallPrice
+V_VIMode = 0
 ```
+- 기준가 `V_RefPrice`가 체결 가능 구간 안이면 그대로, 벗어나면 가장 가까운 경계 → **기준가 우선 동가 처리(실제 거래소 규칙)**
+- 체결량 0이면 가격 불변
+
+### 9.7 ARENA `!=` 우회
+`A != B` → `1 - (A == B)`, `A==B && C==D` → `(A==B)*(C==D)`.
 
 ---
 
-## 10. 시뮬레이션 종료 조건
+## 10. 시뮬레이션 종료 조건 및 실패 처리
 
-### 10.1 감시 entity 흐름
-
+### 10.1 감시(Monitor) 엔티티 흐름
 ```
-[Create_Monitor] (1초마다)
-    ↓
-[Decide_InBand] (현재가가 119~131 범위?)
-    ↓True                              ↓False
-[Decide_FirstEntry]                [Assign_OutBand]
-    ↓True (처음)   ↓False (계속)        ↓
-[Assign_RecordEntry]  [Decide_TimeUp]  [Dispose_Monitor]
-    ↓             ↓True       ↓False
-    │       [Assign_StopMarket]   │
-    │             ↓               │
-    └──→ [Record들 → ReadWrite_Result → Dispose_Monitor]
-```
-
-### 10.2 Create_Monitor 설정
-
-```
-Type: Constant
-Value: 1
-Units: Seconds
-Max Arrivals: Infinite
-First Creation: 1.0
+Create_Monitor (1초, First Creation 1.0)
+ → Assign_SampleMetrics (§11)
+ → Decide_InBand
+     ├─True → Decide_FirstEntry
+     │          ├─True  → Assign_RecordEntry ─┐
+     │          └─False → Decide_TimeUp        │
+     │                      ├─True → Assign_StopMarket → Assign_FinalCalc → ReadWrite_Result → Dispose
+     │                      └─False ───────────┤
+     └─False → Assign_OutBand ─────────────────┤
+                                               ↓
+                                       Decide_FailCheck (TNOW==3599 && V_MarketStop==0)
+                                         ├─True → Assign_FailFinal → Assign_FinalCalc → ReadWrite_Result → Dispose
+                                         └─False → Dispose_Monitor
 ```
 
-### 10.3 Decide_InBand
-
+### 10.2 Decide_InBand (밴드 + 접속매매 동시 조건)
 ```
-If: Expression
-Value: (V_CurrentPrice >= 119) && (V_CurrentPrice <= 131)
+(V_CurrentPrice >= V_FundamentalPrice*(1 - V_BandPct/100)) &&
+(V_CurrentPrice <= MN(130, V_FundamentalPrice*(1 + V_BandPct/100))) &&
+(V_VIMode == 0)
 ```
+> 베이스 밴드는 119~130원. **`V_VIMode==0`** 조건으로 VI 정지시간이 안정 판정에 끼지 않게 한다(오류 수정 §13.2).
 
-### 10.4 Assign_RecordEntry (처음 진입 시)
-
+### 10.3 Assign_RecordEntry (최초/재진입 시)
 ```
 V_BandEntryTime = TNOW
-V_InBandFlag = 1
-V_FirstDiscoveryTime = (V_FirstDiscoveryTime == -1) * TNOW + 
-                       (1 - (V_FirstDiscoveryTime == -1)) * V_FirstDiscoveryTime
+V_StabilityActive = 1        ← 한 번 켜면 끝까지 유지(리셋 금지)
+V_FirstDiscoveryTime = (V_FirstDiscoveryTime == -1) * TNOW
+                     + (1 - (V_FirstDiscoveryTime == -1)) * V_FirstDiscoveryTime
 ```
 
-→ 처음 진입이면 TNOW 기록, 이미 기록되어 있으면 그대로 유지
-
-### 10.5 Decide_TimeUp
-
+### 10.4 Decide_TimeUp / Assign_StopMarket / Assign_OutBand
 ```
-If: Expression
-Value: (TNOW - V_BandEntryTime) >= 120
+Decide_TimeUp:  (TNOW - V_BandEntryTime) >= V_DwellTime
+Assign_StopMarket:  V_MarketStop = 1 ; V_EndTime = TNOW ; V_DiscoveryFail = 0
+Assign_OutBand:  V_BandEntryTime = -1   (V_StabilityActive는 끄지 않음)
 ```
 
-### 10.6 Assign_StopMarket
-
+### 10.5 실패 복제 기록 (Decide_FailCheck / Assign_FailFinal)
+성공하지 못한 모든 출구를 `Decide_FailCheck`로 모아, 마지막 초(3599)에 미발견이면 실패 한 줄을 기록한다.
 ```
-V_MarketStop = 1
-V_EndTime = TNOW
+Decide_FailCheck:  (TNOW == 3599) && (V_MarketStop == 0)
+Assign_FailFinal:  V_DiscoveryFail = 1 ; V_EndTime = 3600
+```
+→ 이후 성공 경로와 **공유**하는 `Assign_FinalCalc → ReadWrite_Result`로 합류. 복제당 정확히 한 줄(성공 또는 실패)이 보장된다.
+> `TNOW==3599`(정확히 한 번)로 해야 한다. `>=3599`로 하면 3599·3600 두 번 걸려 **2중 기록**(§13.8).
+
+### 10.6 Assign_FinalCalc (성공·실패 공유)
+```
+V_UnfilledQty    = V_Ur                                       (= Σ BidQty + Σ AskQty 스냅샷)
+V_StabilityScore = V_SumSqDev / MX(V_NSamples, 1)             (= S)
+V_FrictionCost   = V_TWUnfilled / ( V_EndTime * MX(V_TotalOrders, 1) )   (= C)
 ```
 
-### 10.7 Assign_OutBand (범위 벗어남)
-
+### 10.7 Run Setup
 ```
-V_BandEntryTime = -1
-V_InBandFlag = 0
-```
-
-### 10.8 Run Setup
-
-```
-Number of Replications: 11 (또는 330)
-Replication Length: 3600 (안전장치)
-Time Units: Seconds
-Base Time Units: Seconds  ← 반드시 Seconds!
+Number of Replications: 14190
+Replication Length: 3600
+Time Units / Base Time Units: Seconds   ← 반드시 Seconds
 Terminating Condition: V_MarketStop == 1
-Initialize Between Replications - Statistics: ✓
-Initialize Between Replications - System: ✓
+Initialize Between Replications - Statistics / System: ✓
 ```
-
-⚠️ **Base Time Units가 Hours로 되어 있으면 시뮬레이션이 안 돌아감!**
 
 ---
 
-## 11. 결과 기록 및 자동 실험
+## 11. 평가지표 수집 (S·D·C)
 
-### 11.1 File 모듈 설정
+ARENA는 복제별 **원자료(S, D, C, 보조지표)**만 출력하고, 정규화·MCDM은 Python 후처리(§14)에서 수행한다.
 
-```
-Name: OutFile_Results
-Access Type: Sequential File
-Operating System File Name: C:\path\to\result.txt
-Structure: Free Format
-End of File Action: Dispose
-Initialize Option: Hold  ← 반드시 Hold (이어쓰기)
-```
+- **D(가격발견 지연)** = `V_EndTime` (성공=조기종료 시각, 실패=3600). 별도 모듈 불필요.
+- **S, C** = 매 1초 도는 Monitor에 **Assign_SampleMetrics**를 끼워 초당 누적.
 
-### 11.2 헤더 쓰기 (시뮬레이션 시작 시 1회)
+### 11.1 Assign_SampleMetrics (Monitor 경로 맨 앞)
+```
+V_Ur = (BidQty(1)+...+BidQty(51)) + (AskQty(1)+...+AskQty(51))      (102개 항)
+V_TWUnfilled += V_Ur
+V_SumSqDev += V_StabilityActive * (1 - V_VIMode)
+            * ( ((V_CurrentPrice - V_FundamentalPrice)/V_FundamentalPrice)
+              * ((V_CurrentPrice - V_FundamentalPrice)/V_FundamentalPrice) )
+V_NSamples += V_StabilityActive * (1 - V_VIMode)
+```
+- `V_TWUnfilled`는 VI 중에도 누적(거래마찰 = VI 대기비용 포함)
+- S 누적은 `V_StabilityActive*(1-V_VIMode)` 게이트로 **최초 진입 후 + 접속매매 중**만
+- 적정가가 시나리오마다 다르므로 편차는 **반드시 `V_FundamentalPrice` 기준**(하드코딩 125 금지, §13.9)
 
-```
-[Create_HeaderInit] (Max Arrivals=1)
-    ↓
-[Assign_SetVIWidth] (V_VIWidth = 4 + NREP)
-    ↓
-[Decide_FirstRep] (NREP == 1?)
-    ↓True            ↓False
-[ReadWrite_Header]  [Dispose]
-    ↓
-[Dispose]
-```
-
-**ReadWrite_Header 내용**: `"VIWidth", "NumVI", "TotalHaltTime", ...` (문자열)
-
-### 11.3 결과 쓰기 (시뮬레이션 종료 시)
-
-```
-[Assign_StopMarket] → [Assign_FinalCalc] → [11개 Record] → [ReadWrite_Result] → [Dispose_Monitor]
-```
-
-**Assign_FinalCalc**:
-```
-V_UnfilledQty = V_TotalOrders - V_FilledOrders
-```
-
-**ReadWrite_Result에 기록할 변수들** (헤더 순서와 동일):
-```
-V_VIWidth, V_NumVI, V_TotalHaltTime, V_TotalTrades, 
-V_TotalTradeVolume, V_CumAbsPriceChange, V_MaxOvershoot,
-V_FirstDiscoveryTime, V_EndTime, V_TotalOrders, V_FilledOrders, V_UnfilledQty
-```
-
-### 11.4 자동 실험 설계
-
-**V_VIWidth 자동 변경**:
-```
-V_VIWidth = 4 + NREP
-```
-
-| NREP | V_VIWidth |
-|---|---|
-| 1 | 5 |
-| 2 | 6 |
-| ... | ... |
-| 11 | 15 |
-
-**또는 V_VIWidth 1값당 30회씩**:
-```
-V_VIWidth = 4 + AINT((NREP - 1) / 30) + 1
-```
-
-→ Number of Replications = 330
+### 11.2 밴드 미진입 실패 처리
+밴드에 한 번도 못 들어간 실패는 `V_NSamples=0` → `S=0`(완벽 안정으로 오인). 이는 `FirstDiscoveryTime == -1`로 식별 가능하므로 **후처리에서 worst값으로 치환**한다(§14).
 
 ---
 
-## 12. 구현 중 만난 주요 이슈와 해결
+## 12. 민감도 분석 자동 실험 설계
 
-### 12.1 ARENA Variable의 Rows 문제
-
-**증상**: `Invalid array dimension for symbol : V_MarketStop` 에러
-
-**원인**: 스칼라 변수의 Rows를 1로 설정하면 ARENA가 1차원 배열로 인식
-
-**해결**: **스칼라 변수와 Attribute는 모두 Rows를 비워둬야 함**
-
-### 12.2 ARENA 학생용 모듈 수 제한
-
-**증상**: BestAsk/BestBid 탐색을 위해 31개 Decide + 31개 Assign 만들었더니 모듈 수 초과
-
-**원인**: 학생용 ARENA 모듈 수 한도 ~150개
-
-**해결**: **MN/MX 함수에 31개 인자를 동시에 주입하는 단일 Assign 수식으로 압축**
-- 매수/매도 라인의 BestAsk/BestBid 탐색 부분 합쳐 ~120개 → ~2개로 축소
-
-### 12.3 BidQty/AskQty 인덱스 범위 초과
-
-**증상**: `Index value 0 of array BidQty argument 1 is out of range`
-
-**원인**: V_CurrentPrice=100인 상태에서 매수 offset -2 → A_Price=98 → 인덱스 = -1
-
-**해결**: **배열 범위를 31에서 51로 확장**
-- 가격대: 100~130 → 80~130
-- 인덱스 매핑: `A_Price - 99` → `A_Price - 79`
-- 압축 수식도 31개 인자 → 51개 인자로 확장
-
-### 12.4 단일가매매 인덱스 에러 (V_BestAsk = 9999)
-
-**증상**: 200번째 즈음에 `Index value 4986 of array BidQty argument 1 is out of range`
-
-**원인**: VI 발동 후 120초 동안 매도잔량이 모두 매칭되어 V_BestAsk=9999가 됨 → V_CallPrice 계산이 5065 같은 비정상값
-
-**해결**: **V_CallPrice 수식에 예외 처리 추가**
-- 한쪽이 비정상이면 정상인 쪽 사용
-- 둘 다 비정상이면 V_CurrentPrice 사용
-- 마지막에 클램핑 `MX(80, MN(130, V_CallPrice))`
-
-### 12.5 ARENA `<` 연산자 문제
-
-**증상**: piecewise 조건식에서 `<` 사용 시 모든 매수 주문이 Dispose로 빠짐
-
-**원인**: 
-1. 첫 번째 항(gap >= 20)이 빠져있었음
-2. ARENA의 `<` 연산자 처리 문제
-
-**해결**: **누적 차분 방식 수식**으로 변경 (5.4 참조)
-- `<` 없이 `>=`만 사용
-- 누적 차분으로 정확한 확률값 도출
-
-### 12.6 ARENA `!=` 연산자 미지원
-
-**증상**: `V_FirstDiscoveryTime != -1` 표현 안 됨
-
-**해결**: `1 - (V_FirstDiscoveryTime == -1)` 로 우회
-
-### 12.7 Label 모듈 입력 포트 없음
-
-**증상**: Decide의 False 출력을 Label로 연결할 수 없음
-
-**원인**: Basic Process의 Label 모듈은 출력 포트만 있고 입력 포트 없음
-
-**해결**: Label은 점프 대상이고, 일반 흐름은 직접 다음 블록으로 연결. Label은 "이 지점의 이름"을 정의하는 용도로만 사용.
-
-### 12.8 Run Setup의 Time Units 오류
-
-**증상**: Create 모듈에서 "1초마다"로 설정해도 시뮬레이션이 사실상 멈춤
-
-**원인**: Base Time Units가 Hours로 설정되어 있음
-
-**해결**: Base Time Units = Seconds로 변경
-
----
-
-## 13. 예비 실험 결과 분석
-
-### 13.1 V_VIWidth별 평균 (30회 반복)
-
-| V_VIWidth | NumVI | TotalTrades | CumAbsPriceChange | MaxOvershoot | FirstDiscoveryTime | EndTime | FillRate(%) | OvershootRate(%) |
-|---|---|---|---|---|---|---|---|---|
-| **5** | 1.0 | 141.47 | 63.83 | 0.07 | 138.17 | 699.87 | 28.77 | 6.7 |
-| 6 | 1.0 | 50.30 | 40.47 | 0.70 | 157.77 | 395.57 | 20.38 | 66.7 |
-| 7 | 1.0 | 17.33 | 29.57 | 1.60 | 170.10 | 306.30 | 10.63 | 93.3 |
-| 8 | 1.0 | 17.70 | 31.83 | 2.43 | 148.50 | 301.90 | 10.87 | 90.0 |
-| **9** | 1.0 | 8.60 | 30.33 | 4.73 | 158.90 | **278.90** | 5.72 | **100** |
-| 10 | 1.0 | 20.87 | 33.00 | 4.67 | 164.63 | 315.07 | 12.39 | 93.3 |
-| 11 | 1.0 | 23.43 | 34.00 | 4.50 | 180.90 | 326.80 | 13.90 | 90.0 |
-| 12 | 1.0 | 21.27 | 32.80 | 4.63 | 182.13 | 324.13 | 12.57 | 93.3 |
-| 13 | 1.0 | 19.73 | 31.90 | 4.77 | 178.77 | 324.27 | 12.12 | 96.7 |
-| 14 | 1.0 | 30.40 | 34.17 | 4.20 | 218.53 | 352.00 | 16.28 | 90.0 |
-| 15 | 1.0 | 26.93 | 31.83 | 4.43 | 213.80 | 346.77 | 15.10 | 96.7 |
-
-### 13.2 주요 관찰
-
-#### 모든 V_VIWidth에서 NumVI=1.0
-모든 시뮬레이션에서 VI가 정확히 1번만 발동됨. 첫 VI 발동 후 단일가매매로 V_RefPrice가 갱신되어 두 번째 VI 발동 전에 종료되는 패턴.
-
-#### V_VIWidth=5의 특이성
-- 거래량 압도적으로 많음 (141 vs 다른 값 8~50)
-- 적정가 초과 거의 없음 (OvershootRate 6.7%)
-- 그러나 종료 시간이 가장 김 (700초)
-- → VI가 자주 발동되어 가격 폭주를 효과적으로 억제
-
-#### V_VIWidth=6의 임계점
-**OvershootRate가 6.7%에서 66.7%로 급격히 증가** → 임계점(critical threshold)
-
-| V_VIWidth | OvershootRate |
-|---|---|
-| 5 | 6.7% ← 적정가 초과 거의 없음 |
-| 6 | 66.7% ← 급격한 증가 |
-| 7~ | 90%+ ← 거의 항상 초과 |
-
-#### V_VIWidth=7 이상의 정체
-VI가 가격 안정에 사실상 기능하지 못함. 적정가를 거의 항상 초과하고 거래량도 매우 적음.
-
-#### V_VIWidth=9의 일관성
-표준편차가 매우 작음 (TotalTrades 표준편차 2.74) → 가장 재현성 높은 결과
-
-### 13.3 잠정 결론
-
-| V_VIWidth | 안정성 | 가격발견 | 유동성 | 종합 |
-|---|---|---|---|---|
-| 5 | ★★★★★ | ★★ | ★★★★★ | 이중적 |
-| 6 | ★★★ | ★★★ | ★★★ | 보통 |
-| 9 | ★ | ★★★★★ | ★ | 이중적 |
-| 14~15 | ★ | ★ | ★★ | 좋지 않음 |
-
-**후보**:
-- V_VIWidth=5: 가격안정성 + 유동성 우수
-- V_VIWidth=6: 모든 면에서 균형적
-
----
-
-## 14. 모델링 방법 요약 (5가지)
-
-### 1. 상태의존적(state-dependent) 포아송 주문 생성 모델
-매 1초마다 잠재 주문 entity를 일정하게 생성한 후, 현재가와 적정가의 차이(gap)에 따라 주문 통과 확률을 달리 부여하는 piecewise 방식. gap이 클수록 매수 압력이 강해지고 매도 압력이 약해지는 시장 미시구조의 동학 반영.
-
-### 2. 호가창의 배열 변수 표현과 압축 수식 기반 BestBid/BestAsk 탐색
-가격대별 매수/매도 잔량을 BidQty/AskQty의 51차원 배열 변수(가격 80~130원)로 모델링. ARENA의 MN/MX 함수에 51개 인자를 동시에 주입하는 단일 Assign 수식으로 압축하여 모듈 수 60개 이상 절감. 학생용 ARENA 모듈 수 제약 극복.
-
-### 3. Label/Go-to-Label 기반 부분 체결 반복 처리
-주문이 한 번에 모두 체결되지 못하고 잔량이 남은 경우, Go to Label 모듈로 BestAsk 탐색 단계로 회귀시켜 다음 매도호가와 연속 매칭을 시도. ARENA에 명시적 반복문이 없는 한계를 Label 메커니즘으로 우회.
-
-### 4. Separate 모듈을 활용한 VI 제어 entity의 비동기 분리
-VI 발동 시점에 Separate 모듈로 제어용 entity를 1개 복제하여 별도 라인으로 분리한 뒤, 120초 Delay 후 단일가매매 로직 실행. 시간 지연(time delay)과 상태 전이(state transition)를 분리하는 표준적 패턴.
-
-### 5. 메타 레벨 감시 entity 기반 종료 조건 검사 및 자동 실험 설계
-매수/매도 주문 entity와 완전히 독립적인 감시 entity를 매 1초마다 생성하여 종료 조건 점검. NREP 변수를 활용한 V_VIWidth 자동 변경과 결과 외부 파일 기록으로 단일 Run으로 11개 변동폭 × 30회 = 330개 데이터 포인트 자동 생성.
-
----
-
-## 15. 발표 자료 검토 사항
-
-### 15.1 사실 오류 (수정 필요)
-
-#### ① 정적 VI 기준가 설명
-**문제**: "하루 중 누적 가격 변동폭이 ±10%"
-
-**수정**: "**직전 단일가매매 체결가** 대비 ±10% 변동 예상 시 발동"
-- 정적 VI 기준가는 하루 중에도 단일가매매가 체결될 때마다 갱신됨 (시가 단일가, VI 단일가, 종가 단일가)
-
-#### ② Chordia 인용 출처
-**문제**: "Chordia, et al.(2001)" 출처 모호
-
-**확인 필요**: 정확한 논문 제목 (예: "Market liquidity and trading activity", *Journal of Finance*, 2001)
-
-### 15.2 표현 개선
-
-#### 평가 기준 화살표 방향 명확화
+### 12.1 시나리오 룩업 + NREP 디코딩
+`Assign_SetVIWidth`(복제당 t=0 1회 실행, Create_HeaderInit, Max Arrivals=1)에서:
 ```
-↑ 주문 체결률: 클수록 좋음
-↓ VI 발동 횟수, 거래정지 시간 등: 작을수록 좋음
+V_Scn       = AINT( (NREP-1) / 330 ) + 1
+V_RepInScn  = MOD( NREP-1, 330 )
+V_VIWidth   = 5 + AINT( V_RepInScn / 30 )
+V_BandPct          = ScnBandPct(V_Scn)
+V_DwellTime        = ScnDwell(V_Scn)
+V_FundamentalPrice = ScnFund(V_Scn)
 ```
+- 시나리오 1개 = VIWidth 11종 × 30 복제 = 330 reps
+- 43 시나리오 → Number of Replications = **14,190**
+> 초기화 엔티티가 주문/감시보다 먼저 실행되도록 **Create_HeaderInit First Creation=0.0, 나머지=1.0**.
 
-#### "수준당 반복 (예비) 30회" → 명확화
-```
-수준당 반복 횟수: 30회 (총 11 × 30 = 330개 데이터 포인트)
-```
+### 12.2 표적 혼합 설계 (43 시나리오)
+베이스를 통과하는 세 개의 2D 슬라이스 (종료조건·적정가의 상호작용은 상한가 130을 통해 발생).
 
-### 15.3 내용 보강
-
-#### 결과 슬라이드에 해석 추가
-```
-▸ 가격안정성: VI 변동폭이 작을수록(5%) 누적 가격 변화가 큼
-▸ 가격발견: 변동폭이 클수록 적정가 진입에 시간이 더 소요됨
-▸ 유동성: 변동폭 5%에서 체결률이 가장 높음
-▸ 잠정 결론: 5~7% 구간이 후보군
-```
-
-#### 한계점 추가
-- 단일 종목 시뮬레이션의 한계 (종목 간 상호작용 미고려)
-- 시간 척도의 단순화
-- 하락 국면 미고려 (상승 국면만 다룸)
-
-### 15.4 예상 질문 대비
-
-**Q1**: "왜 5%~15%만 봤나요?"
-→ "현재 KRX 제도 ±10%를 중심으로 한 합리적 범위. ±5% 미만은 너무 빈번한 발동, 15% 초과는 사실상 발동 안 됨"
-
-**Q2**: "포아송 가정이 한국 시장에 맞나요?"
-→ "단순화 가정이며, 실제 시장은 자기여기적(self-exciting) 특성을 보임. 향후 Hawkes 프로세스 등으로 보완 예정"
-
-**Q3**: "VI 변동폭이 클수록 가격발견 시간이 늘어나는 이유?"
-→ "변동폭 5%에서는 VI 발동 후 단일가매매로 가격이 한 번에 크게 점프하여 빠르게 도달. 변동폭이 크면 VI 미발동 상태로 천천히 수렴"
-
-**Q4**: "유동성 지표로 체결률만 보면 충분한가요?"
-→ "체결률 외에 평균 주문 대기시간, 호가 스프레드 등도 추가 분석 예정"
-
----
-
-## 16. 부록: 시장 매칭 원리
-
-### 16.1 핵심 원리
-
-매수자는 "**이 가격까지는 사겠다**" → 매수 주문가 = 지불할 수 있는 **최대** 가격
-매도자는 "**이 가격 이상으로는 팔겠다**" → 매도 주문가 = 받고 싶은 **최소** 가격
-
-**체결 조건**: 매수자의 최대 의향가 ≥ 매도자의 최소 의향가
-
-### 16.2 매칭 예시
-
-호가창:
-```
-매도호가
-  110원: 5주
-  108원: 3주  ← BestAsk
-─────────────
-매수호가
-  105원: 2주  ← BestBid
-  103원: 4주
-```
-
-| 매수 주문가 | BestAsk | 결과 | 체결가 |
+| 블록 | 고정 | 변동 | 수 |
 |---|---|---|---|
-| 109 | 108 | ✅ 체결 | **108원** |
-| 108 | 108 | ✅ 체결 | 108원 |
-| 107 | 108 | ❌ 불가 | (BidQty[107]에 적재) |
+| A. 종료조건 격자 | 적정가=125 | band%{3,4,5,6,7} × dwell{60,90,120,150,180} | 25 |
+| B. band%×적정가 | dwell=120 | band%{3,4,5,6,7} × 적정가{115,120} | 10 |
+| C. dwell×적정가 | band%=5 | dwell{60,90,150,180} × 적정가{115,120} | 8 |
 
-**가격 우선 원칙**: 매수자가 109까지 낼 의향이 있어도, 108에 파는 매도자가 있으면 **108에 체결** (매수자에게 유리).
+**룩업 배열 초기값**(43개, 블록 A→B→C 순):
+```
+ScnBandPct: 3,3,3,3,3, 4,4,4,4,4, 5,5,5,5,5, 6,6,6,6,6, 7,7,7,7,7,  3,3,4,4,5,5,6,6,7,7,  5,5,5,5,5,5,5,5
+ScnDwell:   60,90,120,150,180 (×5블록),  120(×10),  60,60,90,90,150,150,180,180
+ScnFund:    125(×25),  115,120,115,120,115,120,115,120,115,120,  115,120,115,120,115,120,115,120
+```
+- 베이스(band5/dwell120/fund125) = **시나리오 13**
+- 적정가 135는 상한가 초과로 무효 → 제외
+> 검증용으로 `V_Scn`을 특정 값(예 13)으로 임시 고정해 단일 시나리오를 330회 돌려볼 수 있다.
 
-### 16.3 본 모델에서
+### 12.3 출력 컬럼 (ReadWrite_Result / Header)
+```
+VIWidth NumVI TotalHaltTime TotalTrades TotalTradeVolume CumAbsPriceChange
+MaxOvershoot FirstDiscoveryTime EndTime TotalOrders FilledOrders UnfilledQty
+Scn BandPct DwellTime FundPrice StabilityScore FrictionCost DiscoveryFail
+```
+- File 모듈: Sequential File, Free Format, **Initialize Option=Hold**(이어쓰기), 경로 예 `C:\Users\strow\simulation\result.txt`
+- 헤더는 `NREP==1`일 때 1회(Other 문자열), 결과는 복제 종료마다 1줄(Variable 값)
+- 공통난수(CRN)는 단일 Run·연속 RNG라 엄밀히는 미적용 → R=30 평균으로 완화(한계로 명시)
 
-`Assign_ExecuteTrade_Buy`에서 `V_CurrentPrice = V_BestAsk` 설정이 이 원리를 구현.
+---
 
-**조건**: `A_Price ≥ V_BestAsk` → 체결 가능 → 체결가는 V_BestAsk
+## 13. 구현 중 만난 주요 이슈와 해결
 
-매도 라인도 마찬가지: `A_Price ≤ V_BestBid` → 체결가는 V_BestBid (매도자에게 유리한 더 높은 가격)
+### 13.1 스칼라 변수 Rows
+스칼라/Attribute의 Rows를 1로 두면 배열로 인식 → **Rows 비우기**.
+
+### 13.2 안정시간에 VI 정지가 집계됨 (오류 수정)
+`Decide_InBand`가 가격만 검사 → VI 정지 120초가 안정으로 둔갑. **`&& V_VIMode==0`** 추가.
+
+### 13.3 단일가 체결 누락 (오류 수정)
+단일가 한 칸만 체결 → 교차 호가창 잔존. **교차분 전체 반복 청산 + 단일가 사후 결정**으로 교체(§9).
+
+### 13.4 미체결량 과대계상 (오류 수정)
+`TotalOrders − FilledOrders`는 체결량만큼 과대 → **호가창 배열 직접 합산**(`Σ BidQty + Σ AskQty`). FillRate도 `2×FilledOrders/TotalOrders`로 보정.
+
+### 13.5 모듈 수 한도 / 인덱스 초과 / `<`,`!=` 미지원 / Time Units
+- 31 Decide+31 Assign → **51-인자 MN/MX 압축 수식**
+- 배열 31→**51 확장**(가격 80~130, 인덱스=가격−79)
+- `<` → 누적 차분 수식, `!=` → `1-(==)`
+- Base Time Units = **Seconds** 필수
+
+### 13.6 Label 입력 포트 없음
+Label은 점프 대상만. 일반 흐름은 본체로 직접 연결, Label 출력도 본체로 연결(본체가 입력 2개 수용).
+
+### 13.7 적정가 출력 0 / 시나리오 미반영 (FundPrice 버그)
+`ScnFund` 배열 초기값 미입력 → 출력 FundPrice=0, 적정가 스윕 무효 위험. **ScnFund 채우기 + `V_FundamentalPrice=ScnFund(V_Scn)` + 출력 컬럼을 V_FundamentalPrice로 매핑**.
+
+### 13.8 실패 복제 2중 기록
+`Decide_FailCheck`를 `TNOW>=3599`로 두면 3599·3600 두 번 기록 → **`TNOW==3599`**로 한 번만.
+
+### 13.9 성공 복제가 실패로 라벨
+`Assign_StopMarket`에 `V_DiscoveryFail=0` 누락 → 초기값 1이 잔존. **`V_DiscoveryFail=0` 추가**.
+
+### 13.10 시나리오 변수 타이밍
+`V_FundamentalPrice`는 주문 생성 첫 틱부터 읽힘 → 초기화 엔티티가 먼저 실행돼야. **Create_HeaderInit First Creation=0.0, 주문/감시=1.0**.
+
+### 13.11 실패 복제 누락 → 편향
+종료 못 한 복제는 한 줄도 안 써져 데이터의 다수가 증발. **Decide_FailCheck/Assign_FailFinal로 실패도 기록**(§10.5).
+
+### 13.12 콘솔 인코딩 (분석 스크립트)
+Windows cp949 콘솔에서 한글/em-dash 출력 크래시 → `sys.stdout.reconfigure(encoding="utf-8")`, CSV는 `utf-8-sig`.
+
+---
+
+## 14. 분석 파이프라인 (Python 후처리)
+
+ARENA가 뽑은 `result.txt`(14,190행)를 받아 평가 체계 전 과정을 자동 계산한다.
+
+### 14.1 `analyze_vi.py`
+| 단계 | 내용 |
+|---|---|
+| 로드 + S-worst 치환 | `FirstDiscoveryTime==-1`(밴드 미진입)인 S를 worst로 |
+| 집계 | (시나리오×VIWidth)별 평균·표준편차·95%CI·실패율 |
+| 정규화 | Z_D=D/3600, Z_C=C, Z_S=S/0.005 (고정 ideal/worst) |
+| 파레토 지배 제거 | 세 Z 모두 열등한 변동폭 제외 |
+| Augmented Tchebycheff | `G = max(λZ) + ρ·Σ(λZ)`, ρ=0.001 (0.0001~0.01 불변 확인) |
+| 가중치 민감도 | 4정책 + 전체 가중치공간(λ≥0.1, 0.05간격) → 1위비율·평균순위·최악순위 |
+
+출력 CSV: `summary_by_scenario_viwidth.csv`, `best_viwidth_per_scenario.csv`, `weight_robustness_all.csv`, `policy_best_per_scenario.csv`
+
+### 14.2 `make_report.py`
+matplotlib(맑은 고딕)로 그래프 7종 생성 → reportlab으로 한국어 PDF 보고서(`VI_분석보고서.pdf`, 9페이지) 자동 작성.
+
+---
+
+## 15. 최종 실험 결과 분석
+
+> 14,190 실행(43 시나리오 × 11 변동폭 × 30 복제)을 단일 Run으로 수집, 이상치 0건 확인.
+
+### 15.1 베이스 시나리오 (밴드 ±5% · 머무름 120초 · 적정가 125)
+- **최적 정적 VI 변동폭 = ±9%** (균형가중 Augmented Tchebycheff 최소)
+- 전체 가중치 조합의 **58.3%에서 1위**, ρ 변화에도 불변 → 매우 강건
+- 차순위 **±10%** → 두 값이 유력 후보군 (현행 ±10%가 합리적 범위임을 시사)
+
+### 15.2 발견 밴드 절벽
+| 밴드 ±% | 가격발견 실패율(적정가125) |
+|---|---|
+| 3% | **78%** |
+| 4% | 0.4% |
+| 5~7% | 0% |
+
+발견 밴드를 ±3%로 좁히면 발견이 사실상 불가능. **평가 기준 밴드는 ±4% 이상**이어야 의미 있는 측정이 가능(베이스 ±5%는 안전 구간).
+
+### 15.3 민감도 — 무엇에 강건하고 무엇에 민감한가
+- ✅ **종료조건(밴드 폭·머무름)에는 강건**: 적정가 125 고정 시 최적이 ±9~10%로 안정
+- ⚠️ **적정가에는 민감**: 적정가 115/120으로 바꾸면 최적이 ±11~15%로 이동(상한가 캡과의 상호작용)
+
+→ "단일 최적값"보다 **시장 상황(적정가의 상한가 대비 위치)에 따른 적정 범위**로 해석하는 것이 타당.
+
+### 15.4 최종 변동폭 선택 규칙 (요약)
+파레토 비지배 → 동일가중 종합점수 → 가중치 강건성(1위비율·평균/최악순위) → 통계적 불확실성(95%CI) → 동률 시 (거래마찰↓ → 실패율↓ → 더 큰 변동폭) 순으로 판단.
+
+---
+
+## 16. 모델링 방법 요약
+
+1. **상태의존적 포아송 주문 생성** — gap에 따른 통과확률 piecewise 부여 (누적 차분 수식으로 `<` 회피)
+2. **호가창 배열 + 압축 탐색** — 51-인자 MN/MX 단일 Assign으로 BestBid/BestAsk 탐색 (모듈 수 절감)
+3. **Label/Go-to 반복 체결** — 명시적 반복문 없는 ARENA에서 부분체결·교차청산 루프 구현
+4. **단일가매매 = 교차 전체 청산 + 사후 단일가 결정** — 거래량 최대화·비교차 보장·기준가 우선
+5. **Separate 기반 VI 제어 분리** — 120초 Delay 후 단일가매매(시간지연·상태전이 분리)
+6. **메타 감시 엔티티 + 초당 지표 샘플러** — 종료조건 점검과 동시에 S/C 원자료 누적, 실패 복제도 기록
+7. **시나리오 룩업 + NREP 디코딩 자동 실험** — 단일 Run으로 43×11×30=14,190 데이터 생성
+8. **Python MCDM 파이프라인** — 정규화→파레토→Augmented Tchebycheff→가중치 민감도→PDF 보고서 자동화
+
+---
+
+## 17. 부록: 시장 매칭 원리
+
+### 17.1 핵심
+- 매수 주문가 = 지불 가능한 **최대** 가격, 매도 주문가 = 받고 싶은 **최소** 가격
+- 체결 조건: 매수자 최대 의향가 ≥ 매도자 최소 의향가
+
+### 17.2 예시
+```
+매도호가  110원:5주 / 108원:3주(BestAsk)
+매수호가  105원:2주(BestBid) / 103원:4주
+```
+| 매수 주문가 | 결과 | 체결가 |
+|---|---|---|
+| 109 | ✅ | **108** (매수자에게 유리) |
+| 108 | ✅ | 108 |
+| 107 | ❌ | BidQty[107] 적재 |
+
+### 17.3 본 모델
+연속매매: `A_Price ≥ V_BestAsk` → 체결가 = V_BestAsk (`V_CurrentPrice = V_BestAsk`).
+단일가매매: 교차분을 최우선끼리 모두 청산한 뒤 `[V_LastMatchedAsk, V_LastMatchedBid]` 구간에서 기준가 우선으로 단일가 결정.
 
 ---
 
 ## 작성 정보
 
-- **작성일**: 2026년 6월
-- **사용 도구**: ARENA Student Edition
-- **참고 논문**: 안일찬 외 (2017). KRX 정적 VI(종목별 변동성완화장치) 도입의 가격안정화 및 가격발견 효과. 재무연구, 30(2), 103-142.
-- **실험 데이터**: 11개 V_VIWidth × 30 Replications = 330 data points
+- **개정일**: 2026년 6월
+- **사용 도구**: ARENA Student Edition + Python(pandas 2.3 / matplotlib / reportlab)
+- **참고 논문**: 안일찬 외 (2017). KRX 정적 VI 도입의 가격안정화 및 가격발견 효과. 재무연구, 30(2), 103-142.
+- **평가 체계**: vi_evaluation_framework (Wierzbicki 1980; Steuer & Choo 1983; Triantaphyllou & Sanchez 1997)
+- **실험 데이터**: 43 시나리오 × 11 변동폭 × 30 복제 = **14,190 data points**
+- **분석 산출물**: analyze_vi.py, make_report.py, VI_분석보고서.pdf, analysis/*.csv
